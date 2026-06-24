@@ -9,20 +9,26 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gen2brain/dlgs"
 )
 
+// ==================== ตัวจัดการต่อ 1 วิดีโอ ====================
 type YtDlpWrapper struct {
-	URL        string
-	OutputDir  string
-	MaxRetries int
-	Concurrent int
-	RetryCount int
-	YtdlpPath  string
-	IsRetry    bool
-	URLHistory []string
+	URL          string
+	OutputDir    string
+	Concurrent   int
+	RetryCount   int
+	YtdlpPath    string
+	IsRetry      bool
+	URLHistory   []string
+	mu           sync.Mutex
+	Progress     float64 // 0-100
+	Status       string
+	SegmentCount int
+	DoneSegments int
 }
 
 type YtdlFile struct {
@@ -34,16 +40,19 @@ type YtdlFile struct {
 	URL string `json:"url"`
 }
 
-func NewYtDlpWrapper(url, outputDir string, maxRetries, concurrent int) *YtDlpWrapper {
+func NewYtDlpWrapper(url, outputDir string, concurrent int) *YtDlpWrapper {
 	return &YtDlpWrapper{
-		URL:        url,
-		OutputDir:  outputDir,
-		MaxRetries: maxRetries,
-		Concurrent: concurrent,
-		RetryCount: 0,
-		IsRetry:    false,
-		YtdlpPath:  findYtdlp(),
-		URLHistory: []string{url},
+		URL:          url,
+		OutputDir:    outputDir,
+		Concurrent:   concurrent,
+		RetryCount:   0,
+		IsRetry:      false,
+		YtdlpPath:    findYtdlp(),
+		URLHistory:   []string{url},
+		Progress:     0,
+		Status:       "pending",
+		SegmentCount: 0,
+		DoneSegments: 0,
 	}
 }
 
@@ -52,6 +61,48 @@ func findYtdlp() string {
 		return path
 	}
 	return "yt-dlp"
+}
+
+func (w *YtDlpWrapper) updateProgress(line string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// ดึงจำนวน segment ทั้งหมด
+	if strings.Contains(line, "Downloading") && strings.Contains(line, "fragments") {
+		re := regexp.MustCompile(`(\d+)\s+fragments`)
+		if matches := re.FindStringSubmatch(line); len(matches) > 1 {
+			fmt.Sscanf(matches[1], "%d", &w.SegmentCount)
+		}
+	}
+
+	// ดึง segment ที่กำลังโหลด
+	if strings.Contains(line, "fragment") {
+		re := regexp.MustCompile(`fragment\s+(\d+)`)
+		if matches := re.FindStringSubmatch(line); len(matches) > 1 {
+			fmt.Sscanf(matches[1], "%d", &w.DoneSegments)
+			if w.SegmentCount > 0 {
+				w.Progress = float64(w.DoneSegments) / float64(w.SegmentCount) * 100
+			}
+		}
+	}
+
+	// ตรวจจับสถานะ
+	if strings.Contains(line, "Merging") {
+		w.Status = "merging"
+	}
+	if strings.Contains(line, "100%") {
+		w.Progress = 100
+		w.Status = "done"
+	}
+	if strings.Contains(line, "ERROR") || strings.Contains(line, "502") {
+		w.Status = "error"
+	}
+}
+
+func (w *YtDlpWrapper) GetProgress() (float64, string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.Progress, w.Status
 }
 
 func showURLDialogWithHistory(oldURL string, errorMsg string, history []string) (string, bool) {
@@ -64,18 +115,17 @@ func showURLDialogWithHistory(oldURL string, errorMsg string, history []string) 
 	}
 
 	message := fmt.Sprintf(
-		"URL ปัจจุบัน: %s\n\nError: %s\n%s\n\nกรุณาใส่ URL ใหม่ (หรือกด Cancel เพื่อยกเลิก):",
+		"URL ปัจจุบัน: %s\n\nError: %s\n%s\n\nกรุณาใส่ URL ใหม่:",
 		oldURL,
 		errorMsg,
 		historyText,
 	)
 
-	newURL, ok, err := dlgs.Entry("🔄 เปลี่ยน URL (รอบที่ "+fmt.Sprint(len(history))+")", message, oldURL)
+	newURL, ok, err := dlgs.Entry("🔄 เปลี่ยน URL", message, oldURL)
 	if err != nil {
 		fmt.Printf("Error showing dialog: %v\n", err)
 		return "", false
 	}
-
 	return newURL, ok
 }
 
@@ -84,7 +134,6 @@ func (w *YtDlpWrapper) findYtdlFile() (string, error) {
 	if err != nil || len(files) == 0 {
 		return "", fmt.Errorf("ไม่พบไฟล์ .ytdl")
 	}
-
 	var latest string
 	var latestTime time.Time
 	for _, f := range files {
@@ -113,7 +162,6 @@ func (w *YtDlpWrapper) updateYtdlFile(ytdlPath, oldPattern, newURL string) error
 			)
 		}
 		ytdlData.URL = strings.ReplaceAll(ytdlData.URL, oldPattern, newURL)
-
 		newData, _ := json.MarshalIndent(ytdlData, "", "  ")
 		return os.WriteFile(ytdlPath, newData, 0644)
 	}
@@ -131,6 +179,7 @@ func extractURLBase(url string) string {
 	return url
 }
 
+// runYtdlp รัน yt-dlp สำหรับ 1 วิดีโอ
 func (w *YtDlpWrapper) runYtdlp(url string) error {
 	args := []string{
 		"--no-progress",
@@ -149,20 +198,12 @@ func (w *YtDlpWrapper) runYtdlp(url string) error {
 
 	cmd := exec.Command(w.YtdlpPath, args...)
 
-	fmt.Printf("\n%s\n", strings.Repeat("=", 60))
-	if w.IsRetry {
-		fmt.Printf("🔄 Retry #%d: %s\n", w.RetryCount, url)
-	} else {
-		fmt.Printf("🔄 Start: %s\n", url)
-	}
-	fmt.Printf("📂 Output: %s\n", w.OutputDir)
-	fmt.Printf("%s\n\n", strings.Repeat("=", 60))
+	fmt.Printf("\n📥 [%s] เริ่มดาวน์โหลด...\n", w.OutputDir)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("สร้าง stdout pipe ไม่ได้: %v", err)
 	}
-
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("สร้าง stderr pipe ไม่ได้: %v", err)
@@ -179,32 +220,28 @@ func (w *YtDlpWrapper) runYtdlp(url string) error {
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
 			line := scanner.Text()
-			fmt.Println(line)
+			fmt.Printf("[%s] %s\n", w.OutputDir, line)
+			w.updateProgress(line)
 
 			if strings.Contains(line, "HTTP Error 502") ||
 				strings.Contains(line, "HTTP Error 403") ||
 				strings.Contains(line, "HTTP Error 404") ||
 				strings.Contains(line, "ERROR:") ||
-				strings.Contains(line, "fragment failed") ||
-				strings.Contains(line, "segments failed") {
+				strings.Contains(line, "fragment failed") {
 				errorChan <- line
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			errorChan <- fmt.Sprintf("stdout scanner error: %v", err)
+			errorChan <- fmt.Sprintf("scanner error: %v", err)
 		}
 	}()
 
-	// อ่าน stderr
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
 			line := scanner.Text()
-			fmt.Printf("[stderr] %s\n", line)
-
-			if strings.Contains(line, "502") ||
-				strings.Contains(line, "403") ||
-				strings.Contains(line, "ERROR:") {
+			fmt.Printf("[%s][stderr] %s\n", w.OutputDir, line)
+			if strings.Contains(line, "502") || strings.Contains(line, "403") {
 				errorChan <- line
 			}
 		}
@@ -215,7 +252,6 @@ func (w *YtDlpWrapper) runYtdlp(url string) error {
 
 	err = cmd.Wait()
 
-	// เช็ค error จาก channel
 	select {
 	case errMsg := <-errorChan:
 		return fmt.Errorf("Error: %s", errMsg)
@@ -229,27 +265,30 @@ func (w *YtDlpWrapper) runYtdlp(url string) error {
 	return nil
 }
 
-// Download เริ่มดาวน์โหลด (รองรับหลายรอบ)
+// Download ดาวน์โหลด 1 วิดีโอ (มี loop retry)
 func (w *YtDlpWrapper) Download() error {
 	currentURL := w.URL
 	attempt := 0
 
 	for {
 		attempt++
-		fmt.Printf("\n📌 รอบที่ %d (ใช้ URL: %s)\n", attempt, currentURL)
+		fmt.Printf("\n🔄 [%s] รอบที่ %d\n", w.OutputDir, attempt)
 
 		err := w.runYtdlp(currentURL)
 
 		if err == nil {
-			fmt.Println("\n✅ ดาวน์โหลดเสร็จสมบูรณ์!")
+			w.Status = "done"
+			w.Progress = 100
+			fmt.Printf("✅ [%s] ดาวน์โหลดเสร็จ!\n", w.OutputDir)
 			return nil
 		}
 
-		fmt.Printf("\n⚠️ รอบที่ %d เจอปัญหา: %v\n", attempt, err)
+		fmt.Printf("⚠️ [%s] Error: %v\n", w.OutputDir, err)
+		w.Status = "error"
 
 		ytdlFile, _ := w.findYtdlFile()
 		if ytdlFile != "" {
-			fmt.Printf("📄 พบไฟล์ .ytdl: %s\n", ytdlFile)
+			fmt.Printf("📄 [%s] พบไฟล์ .ytdl\n", w.OutputDir)
 		}
 
 		newURL, ok := showURLDialogWithHistory(
@@ -259,83 +298,229 @@ func (w *YtDlpWrapper) Download() error {
 		)
 
 		if !ok || newURL == "" {
-			fmt.Println("❌ ผู้ใช้ยกเลิกการดาวน์โหลด")
+			fmt.Printf("❌ [%s] ผู้ใช้ยกเลิก\n", w.OutputDir)
 			return fmt.Errorf("ผู้ใช้ยกเลิก")
 		}
 
 		if newURL == currentURL {
-			fmt.Println("ℹ️ URL ไม่เปลี่ยนแปลง, ลองใหม่ด้วย URL เดิม")
+			fmt.Printf("ℹ️ [%s] URL ไม่เปลี่ยนแปลง\n", w.OutputDir)
 			time.Sleep(2 * time.Second)
 			continue
-		}
-
-		alreadyUsed := false
-		for _, u := range w.URLHistory {
-			if u == newURL {
-				alreadyUsed = true
-				break
-			}
-		}
-
-		if alreadyUsed {
-			fmt.Println("⚠️ URL นี้เคยใช้ไปแล้ว! อาจจะไม่ช่วยอะไร")
-			retry, err := dlgs.Question("ยืนยัน", "URL นี้เคยใช้ไปแล้ว คุณแน่ใจว่าจะลองอีกครั้ง?", true)
-			if err != nil {
-				fmt.Printf("⚠️ Error showing dialog: %v\n", err)
-				return fmt.Errorf("dialog error: %v", err)
-			}
-			if !retry {
-				fmt.Println("❌ ผู้ใช้ยกเลิก")
-				return fmt.Errorf("ผู้ใช้ยกเลิก")
-			}
 		}
 
 		if ytdlFile != "" {
 			oldBase := extractURLBase(currentURL)
 			newBase := extractURLBase(newURL)
 			if oldBase != newBase {
-				if err := w.updateYtdlFile(ytdlFile, oldBase, newBase); err != nil {
-					fmt.Printf("⚠️ อัปเดตไฟล์ .ytdl ไม่ได้: %v\n", err)
-				} else {
-					fmt.Println("✅ อัปเดตไฟล์ .ytdl สำเร็จ")
-				}
-			} else {
-				fmt.Println("ℹ️ URL base ไม่เปลี่ยนแปลง, ไม่ต้องอัปเดต .ytdl")
+				w.updateYtdlFile(ytdlFile, oldBase, newBase)
 			}
 		}
 
 		w.URLHistory = append(w.URLHistory, newURL)
 		currentURL = newURL
 		w.IsRetry = true
-		w.RetryCount++
-
-		fmt.Printf("\n🔄 เตรียมลองใหม่ด้วย URL: %s\n", currentURL)
-		fmt.Printf("📊 จำนวน URL ที่ลองแล้ว: %d\n", len(w.URLHistory))
 	}
 }
+
+// ==================== Worker Pool สำหรับหลายวิดีโอ ====================
+
+type DownloadJob struct {
+	URL       string
+	OutputDir string
+	ID        int
+}
+
+type DownloadResult struct {
+	ID      int
+	URL     string
+	Success bool
+	Error   error
+}
+
+// WorkerPool จัดการการดาวน์โหลดหลายวิดีโอพร้อมกัน
+type WorkerPool struct {
+	NumWorkers int
+	Concurrent int // ต่อวิดีโอ
+	Jobs       chan DownloadJob
+	Results    chan DownloadResult
+	Wg         sync.WaitGroup
+}
+
+func NewWorkerPool(numWorkers, concurrent int) *WorkerPool {
+	return &WorkerPool{
+		NumWorkers: numWorkers,
+		Concurrent: concurrent,
+		Jobs:       make(chan DownloadJob, 100),
+		Results:    make(chan DownloadResult, 100),
+	}
+}
+
+func (p *WorkerPool) Start() {
+	for i := 0; i < p.NumWorkers; i++ {
+		p.Wg.Add(1)
+		go p.worker(i)
+	}
+}
+
+func (p *WorkerPool) worker(id int) {
+	defer p.Wg.Done()
+	fmt.Printf("🧵 Worker %d เริ่มทำงาน\n", id)
+
+	for job := range p.Jobs {
+		fmt.Printf("\n🚀 Worker %d: กำลังโหลด %s\n", id, job.URL)
+
+		wrapper := NewYtDlpWrapper(job.URL, job.OutputDir, p.Concurrent)
+		err := wrapper.Download()
+
+		result := DownloadResult{
+			ID:      job.ID,
+			URL:     job.URL,
+			Success: err == nil,
+			Error:   err,
+		}
+		p.Results <- result
+
+		if err == nil {
+			fmt.Printf("✅ Worker %d: โหลด %s สำเร็จ!\n", id, job.URL)
+		} else {
+			fmt.Printf("❌ Worker %d: โหลด %s ล้มเหลว: %v\n", id, job.URL, err)
+		}
+	}
+}
+
+func (p *WorkerPool) AddJob(url, outputDir string, id int) {
+	p.Jobs <- DownloadJob{
+		URL:       url,
+		OutputDir: outputDir,
+		ID:        id,
+	}
+}
+
+func (p *WorkerPool) Wait() {
+	close(p.Jobs)
+	p.Wg.Wait()
+	close(p.Results)
+}
+
+// ==================== Main ====================
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Printf("Usage: %s <URL> [output_dir]\n", os.Args[0])
-		fmt.Printf("Example: %s https://example.com/video.m3u8\n", os.Args[0])
-		fmt.Printf("Example: %s https://example.com/video.m3u8 ./downloads\n", os.Args[0])
+		fmt.Println("📖 วิธีใช้งาน:")
+		fmt.Printf("  %s <URL> [output_dir]          - โหลดทีละตัว\n", os.Args[0])
+		fmt.Printf("  %s -batch <file> [workers]     - โหลดหลายตัวจากไฟล์\n", os.Args[0])
+		fmt.Println("\n📄 ไฟล์ batch: แต่ละบรรทัดคือ URL และ output_dir (คั่นด้วย space)")
+		fmt.Println("   Example: https://video1.com/m3u8 ./videos1")
+		fmt.Println("   Example: https://video2.com/m3u8 ./videos2")
 		os.Exit(1)
 	}
 
-	url := os.Args[1]
-	outputDir := "."
-	if len(os.Args) > 2 {
-		outputDir = os.Args[2]
+	// โหมดเดี่ยว (Single)
+	if os.Args[1] != "-batch" {
+		url := os.Args[1]
+		outputDir := "."
+		if len(os.Args) > 2 {
+			outputDir = os.Args[2]
+		}
+		os.MkdirAll(outputDir, 0755)
+
+		wrapper := NewYtDlpWrapper(url, outputDir, 8)
+		if err := wrapper.Download(); err != nil {
+			fmt.Printf("❌ %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("\n🎉 โหลดเสร็จเรียบร้อย!")
+		os.Exit(0)
 	}
 
-	os.MkdirAll(outputDir, 0755)
-
-	wrapper := NewYtDlpWrapper(url, outputDir, 999, 8)
-
-	if err := wrapper.Download(); err != nil {
-		fmt.Printf("\n❌ %v\n", err)
+	// โหมด Batch (หลายวิดีโอ)
+	if len(os.Args) < 3 {
+		fmt.Println("❌ ต้องระบุไฟล์ batch")
 		os.Exit(1)
 	}
 
-	fmt.Println("\n🎉 โหลดเสร็จเรียบร้อย!")
+	batchFile := os.Args[2]
+	numWorkers := 3 // ค่าเริ่มต้น
+	if len(os.Args) > 3 {
+		fmt.Sscanf(os.Args[3], "%d", &numWorkers)
+	}
+
+	// อ่านไฟล์ batch
+	data, err := os.ReadFile(batchFile)
+	if err != nil {
+		fmt.Printf("❌ อ่านไฟล์ไม่ได้: %v\n", err)
+		os.Exit(1)
+	}
+
+	lines := strings.Split(string(data), "\n")
+	jobs := []DownloadJob{}
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) < 1 {
+			continue
+		}
+		url := parts[0]
+		outputDir := "."
+		if len(parts) > 1 {
+			outputDir = parts[1]
+		}
+		os.MkdirAll(outputDir, 0755)
+
+		jobs = append(jobs, DownloadJob{
+			URL:       url,
+			OutputDir: outputDir,
+			ID:        i + 1,
+		})
+	}
+
+	if len(jobs) == 0 {
+		fmt.Println("❌ ไม่พบ URL ในไฟล์ batch")
+		os.Exit(1)
+	}
+
+	fmt.Printf("📊 พบ %d วิดีโอ, ใช้ %d worker\n", len(jobs), numWorkers)
+
+	// สร้าง Worker Pool
+	pool := NewWorkerPool(numWorkers, 8)
+	pool.Start()
+
+	// ส่งงาน
+	for _, job := range jobs {
+		pool.AddJob(job.URL, job.OutputDir, job.ID)
+	}
+
+	// รอผล
+	go func() {
+		pool.Wait()
+	}()
+
+	// แสดงผลลัพธ์แบบ real-time
+	successCount := 0
+	failCount := 0
+	for result := range pool.Results {
+		if result.Success {
+			successCount++
+			fmt.Printf("✅ [Job %d] สำเร็จ\n", result.ID)
+		} else {
+			failCount++
+			fmt.Printf("❌ [Job %d] ล้มเหลว: %v\n", result.ID, result.Error)
+		}
+		fmt.Printf("📊 ความคืบหน้า: %d/%d (สำเร็จ %d, ล้มเหลว %d)\n",
+			successCount+failCount, len(jobs), successCount, failCount)
+	}
+
+	fmt.Printf("\n🎉 สรุป: สำเร็จ %d, ล้มเหลว %d\n", successCount, failCount)
 }
+
+/*
+
+go run main.go "url"	โหลดทีละ 1 ตัว
+go run main.go "url1" "url2" "url3"	โหลด 3 ตัวพร้อมกัน
+go run main.go -batch videos.txt	โหลดจากไฟล์ batch
+go run main.go -batch videos.txt 5	โหลดจากไฟล์ batch ใช้ 5 workers
+
+*/
