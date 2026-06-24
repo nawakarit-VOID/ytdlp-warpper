@@ -177,6 +177,7 @@ func extractURLBase(url string) string {
 	}
 	return url
 }
+
 func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 	outputPath := filepath.Join(w.OutputDir, w.FileName)
 	tempOutput := filepath.Join(w.OutputDir, fmt.Sprintf("%d_%s", w.ID, w.FileName))
@@ -213,17 +214,24 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 		return fmt.Errorf("เริ่ม yt-dlp ไม่ได้: %v", err)
 	}
 
+	// Monitor cancellation
+	go func() {
+		<-w.CancelChan
+		cmd.Process.Kill()
+	}()
+
 	errorChan := make(chan string, 10)
 	doneChan := make(chan bool, 2)
 
+	// Read stdout
 	go func() {
+		defer func() { doneChan <- true }()
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
 			line := scanner.Text()
 			w.updateProgress(line)
 			statusChan <- line
 
-			// ✅ ตรวจจับ HTTP Error
 			if strings.Contains(line, "HTTP Error") ||
 				strings.Contains(line, "ERROR:") ||
 				strings.Contains(line, "fragment failed") ||
@@ -235,16 +243,17 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 		if err := scanner.Err(); err != nil {
 			errorChan <- fmt.Sprintf("scanner error: %v", err)
 		}
-		doneChan <- true
+		close(errorChan)
 	}()
 
+	// Read stderr
 	go func() {
+		defer func() { doneChan <- true }()
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
 			line := scanner.Text()
 			statusChan <- "[stderr] " + line
 
-			// ✅ ตรวจจับ HTTP Error ใน stderr
 			if strings.Contains(line, "HTTP Error") ||
 				strings.Contains(line, "ERROR:") ||
 				strings.Contains(line, "403") ||
@@ -256,31 +265,30 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 		if err := scanner.Err(); err != nil {
 			errorChan <- fmt.Sprintf("stderr scanner error: %v", err)
 		}
-		doneChan <- true
+		close(errorChan)
 	}()
 
-	select {
-	case <-w.CancelChan:
-		cmd.Process.Kill()
-		return fmt.Errorf("ผู้ใช้ยกเลิก")
-	case <-doneChan:
-		<-doneChan
-	}
+	// Wait for both goroutines
+	<-doneChan
+	<-doneChan
 
 	err = cmd.Wait()
 
-	// ✅ ตรวจสอบ Error จาก channel ก่อน
-	select {
-	case errMsg := <-errorChan:
-		return fmt.Errorf("HTTP Error: %s", errMsg)
-	default:
+	// Collect errors
+	var errorMessages []string
+	for errMsg := range errorChan {
+		errorMessages = append(errorMessages, errMsg)
+	}
+
+	if len(errorMessages) > 0 {
+		return fmt.Errorf("HTTP Error: %s", strings.Join(errorMessages, "; "))
 	}
 
 	if err != nil {
 		return err
 	}
 
-	// เปลี่ยนชื่อไฟล์
+	// Rename file
 	if tempOutput != outputPath {
 		if _, err := os.Stat(tempOutput); err == nil {
 			os.Rename(tempOutput, outputPath)
@@ -290,6 +298,7 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 
 	return nil
 }
+
 func (w *YtDlpWrapper) Download(statusChan chan<- string) error {
 	currentURL := w.URL
 	attempt := 0
