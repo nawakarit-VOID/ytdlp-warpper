@@ -25,7 +25,7 @@ import (
 type YtDlpWrapper struct {
 	URL          string
 	OutputDir    string
-	FileName     string // ✅ เพิ่มฟิลด์นี้
+	FileName     string
 	Concurrent   int
 	RetryCount   int
 	YtdlpPath    string
@@ -39,6 +39,7 @@ type YtDlpWrapper struct {
 	Title        string
 	CancelChan   chan bool
 	IsRunning    bool
+	ID           int
 }
 
 type YtdlFile struct {
@@ -50,7 +51,7 @@ type YtdlFile struct {
 	URL string `json:"url"`
 }
 
-func NewYtDlpWrapper(url, outputDir, fileName string, concurrent int) *YtDlpWrapper {
+func NewYtDlpWrapper(url, outputDir, fileName string, concurrent, id int) *YtDlpWrapper {
 	return &YtDlpWrapper{
 		URL:          url,
 		OutputDir:    outputDir,
@@ -67,6 +68,7 @@ func NewYtDlpWrapper(url, outputDir, fileName string, concurrent int) *YtDlpWrap
 		Title:        fileName,
 		CancelChan:   make(chan bool, 1),
 		IsRunning:    false,
+		ID:           id,
 	}
 }
 
@@ -109,7 +111,6 @@ func (w *YtDlpWrapper) updateProgress(line string) {
 		w.Status = "❌ Error: " + line
 	}
 
-	// ดึงชื่อวิดีโอ
 	if strings.Contains(line, "[download]") && strings.Contains(line, ".mp4") {
 		re := regexp.MustCompile(`\[download\]\s+(.+?\.mp4)`)
 		if matches := re.FindStringSubmatch(line); len(matches) > 1 {
@@ -175,17 +176,17 @@ func extractURLBase(url string) string {
 }
 
 func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
-	// 🔥 ใช้ชื่อไฟล์ที่ผู้ใช้ตั้ง
 	outputPath := filepath.Join(w.OutputDir, w.FileName)
+	tempOutput := filepath.Join(w.OutputDir, fmt.Sprintf("%d_%s", w.ID, w.FileName))
 
 	args := []string{
 		"--no-progress",
 		"--newline",
 		"-N", fmt.Sprintf("%d", w.Concurrent),
-		"--fragment-retries", "5",
+		"--fragment-retries", "3",
 		"--retries", "3",
 		"--socket-timeout", "30",
-		"-o", outputPath, // ✅ ใช้ชื่อที่ผู้ใช้ตั้ง
+		"-o", tempOutput,
 		url,
 	}
 
@@ -213,7 +214,6 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 	errorChan := make(chan string, 10)
 	doneChan := make(chan bool, 2)
 
-	// อ่าน stdout
 	go func() {
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
@@ -221,11 +221,11 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 			w.updateProgress(line)
 			statusChan <- line
 
-			if strings.Contains(line, "HTTP Error 502") ||
-				strings.Contains(line, "HTTP Error 403") ||
-				strings.Contains(line, "HTTP Error 404") ||
+			if strings.Contains(line, "HTTP Error") ||
 				strings.Contains(line, "ERROR:") ||
-				strings.Contains(line, "fragment failed") {
+				strings.Contains(line, "fragment failed") ||
+				strings.Contains(line, "segments failed") ||
+				strings.Contains(line, "Got error:") {
 				errorChan <- line
 			}
 		}
@@ -235,13 +235,17 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 		doneChan <- true
 	}()
 
-	// อ่าน stderr
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
 			line := scanner.Text()
 			statusChan <- "[stderr] " + line
-			if strings.Contains(line, "502") || strings.Contains(line, "403") {
+
+			if strings.Contains(line, "HTTP Error") ||
+				strings.Contains(line, "ERROR:") ||
+				strings.Contains(line, "403") ||
+				strings.Contains(line, "404") ||
+				strings.Contains(line, "502") {
 				errorChan <- line
 			}
 		}
@@ -251,7 +255,6 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 		doneChan <- true
 	}()
 
-	// รอให้ goroutine จบ หรือยกเลิก
 	select {
 	case <-w.CancelChan:
 		cmd.Process.Kill()
@@ -264,12 +267,19 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 
 	select {
 	case errMsg := <-errorChan:
-		return fmt.Errorf("Error: %s", errMsg)
+		return fmt.Errorf("HTTP Error: %s", errMsg)
 	default:
 	}
 
 	if err != nil {
 		return err
+	}
+
+	if tempOutput != outputPath {
+		if _, err := os.Stat(tempOutput); err == nil {
+			os.Rename(tempOutput, outputPath)
+			statusChan <- fmt.Sprintf("📝 เปลี่ยนชื่อไฟล์เป็น: %s", w.FileName)
+		}
 	}
 
 	return nil
@@ -294,57 +304,45 @@ func (w *YtDlpWrapper) Download(statusChan chan<- string) error {
 			return nil
 		}
 
-		// ตรวจสอบว่าถูกยกเลิก
 		select {
 		case <-w.CancelChan:
 			return fmt.Errorf("ผู้ใช้ยกเลิก")
 		default:
 		}
 
-		statusChan <- fmt.Sprintf("⚠️ Error: %v", err)
-		w.Status = "❌ Error"
+		errMsg := err.Error()
+		statusChan <- fmt.Sprintf("⚠️ Error: %s", errMsg)
+		w.Status = "❌ " + errMsg
 
-		ytdlFile, _ := w.findYtdlFile()
-		if ytdlFile != "" {
-			statusChan <- "📄 พบไฟล์ .ytdl"
+		if strings.Contains(errMsg, "HTTP Error") ||
+			strings.Contains(errMsg, "403") ||
+			strings.Contains(errMsg, "404") ||
+			strings.Contains(errMsg, "502") {
+
+			statusChan <- "⏸️ กรุณาเปลี่ยน URL (HTTP Error)"
+			return fmt.Errorf("HTTP Error: %s", errMsg)
 		}
 
-		// เปลี่ยน URL อัตโนมัติ (ถ้ารู้รูปแบบ)
-		newURL := w.autoGenerateNewURL(currentURL)
-		if newURL != "" && newURL != currentURL {
-			statusChan <- fmt.Sprintf("🔄 เปลี่ยน URL อัตโนมัติ: %s", newURL)
-			if ytdlFile != "" {
-				oldBase := extractURLBase(currentURL)
-				newBase := extractURLBase(newURL)
-				if oldBase != newBase {
-					w.updateYtdlFile(ytdlFile, oldBase, newBase)
-				}
-			}
-			w.URLHistory = append(w.URLHistory, newURL)
-			currentURL = newURL
-			w.IsRetry = true
-			continue
-		}
-
-		statusChan <- "⏸️ รอผู้ใช้ป้อน URL ใหม่..."
-		return fmt.Errorf("รอ URL ใหม่: %v", err)
+		statusChan <- "🔄 ลองใหม่อัตโนมัติ..."
+		time.Sleep(2 * time.Second)
+		w.IsRetry = true
 	}
 }
 
+/*
 func (w *YtDlpWrapper) autoGenerateNewURL(oldURL string) string {
 	// ตัวอย่าง: ถ้า URL เปลี่ยนแค่ token หรือ timestamp
 	// ตรงนี้คุณสามารถเขียน logic ของคุณเอง
 	return ""
 }
-
-// ==================== GUI Application ====================
+*/
 
 // ==================== GUI Application ====================
 
 type DownloadItem struct {
 	URL       string
 	OutputDir string
-	FileName  string // ✅ เพิ่มฟิลด์นี้
+	FileName  string
 	Wrapper   *YtDlpWrapper
 	Status    string
 	Progress  float64
@@ -359,6 +357,7 @@ type App struct {
 	mu           sync.Mutex
 	QueueCount   *widget.Label
 	AddBtn       *widget.Button
+	Wg           sync.WaitGroup // ✅ เพิ่ม
 }
 
 func NewApp() *App {
@@ -378,11 +377,15 @@ func (a *App) AddDownload(url, outputDir, fileName string) {
 		}
 	}
 
+	if !strings.Contains(fileName, ".") {
+		fileName = fileName + ".mp4"
+	}
+
 	item := &DownloadItem{
 		URL:       url,
 		OutputDir: outputDir,
 		FileName:  fileName,
-		Wrapper:   NewYtDlpWrapper(url, outputDir, fileName, 8),
+		Wrapper:   NewYtDlpWrapper(url, outputDir, fileName, 8, id),
 		Status:    "⏳ กำลังเริ่ม...",
 		Progress:  0,
 		Title:     fileName,
@@ -392,7 +395,90 @@ func (a *App) AddDownload(url, outputDir, fileName string) {
 	a.mu.Unlock()
 
 	a.UpdateUI()
+
+	a.Wg.Add(1)
 	go a.startDownload(item)
+}
+
+func (a *App) startDownload(item *DownloadItem) {
+	defer a.Wg.Done()
+
+	statusChan := make(chan string, 100)
+
+	go func() {
+		err := item.Wrapper.Download(statusChan)
+		if err != nil {
+			if strings.Contains(err.Error(), "HTTP Error") {
+				item.Status = "⚠️ " + err.Error()
+				a.UpdateUI()
+
+				fyne.Do(func() {
+					a.ShowURLDialog(item)
+				})
+			} else {
+				item.Status = "❌ " + err.Error()
+				a.UpdateUI()
+			}
+		}
+	}()
+
+	for msg := range statusChan {
+		item.Status = msg
+		progress, _, title := item.Wrapper.GetProgress()
+		item.Progress = progress
+		if title != "" && title != item.Title {
+			item.Title = title
+		}
+		a.UpdateUI()
+	}
+}
+
+func (a *App) CancelDownload(index int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if index < len(a.Items) {
+		item := a.Items[index]
+		if item.Wrapper.IsRunning {
+			select {
+			case item.Wrapper.CancelChan <- true:
+			default:
+			}
+			item.Status = "⏹️ ยกเลิกแล้ว"
+			a.UpdateUI()
+		}
+	}
+}
+
+func (a *App) RemoveDownload(index int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if index < len(a.Items) {
+		item := a.Items[index]
+		if item.Wrapper.IsRunning {
+			select {
+			case item.Wrapper.CancelChan <- true:
+			default:
+			}
+		}
+		a.Items = append(a.Items[:index], a.Items[index+1:]...)
+		a.UpdateUI()
+	}
+}
+
+func (a *App) UpdateUI() {
+	fyne.Do(func() {
+		if a.DownloadList != nil {
+			a.DownloadList.Refresh()
+		}
+		if a.QueueCount != nil {
+			a.mu.Lock()
+			count := len(a.Items)
+			a.mu.Unlock()
+			a.QueueCount.SetText(fmt.Sprintf("📊 คิว: %d", count))
+		}
+	})
 }
 
 func (a *App) ShowAddDialog() {
@@ -466,96 +552,49 @@ func (a *App) ShowRenameDialog(item *DownloadItem) {
 		}, a.Window)
 }
 
-func (a *App) startDownload(item *DownloadItem) {
-	statusChan := make(chan string, 100)
-
-	go func() {
-		err := item.Wrapper.Download(statusChan)
-		if err != nil {
-			item.Status = "❌ " + err.Error()
-			a.UpdateUI()
-		}
-	}()
-
-	for msg := range statusChan {
-		item.Status = msg
-		progress, _, title := item.Wrapper.GetProgress()
-		item.Progress = progress
-		if title != "" && title != item.Title {
-			item.Title = title
-		}
-		a.UpdateUI()
-	}
-}
-
-func (a *App) CancelDownload(index int) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if index < len(a.Items) {
-		item := a.Items[index]
-		if item.Wrapper.IsRunning {
-			select {
-			case item.Wrapper.CancelChan <- true:
-			default:
-			}
-			item.Status = "⏹️ ยกเลิกแล้ว"
-			a.UpdateUI()
-		}
-	}
-}
-
-func (a *App) RemoveDownload(index int) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if index < len(a.Items) {
-		a.Items = append(a.Items[:index], a.Items[index+1:]...)
-		a.UpdateUI()
-	}
-}
-
-func (a *App) UpdateUI() {
-	// ใช้ fyne.Do() เพื่ออัปเดต UI ใน Main Thread
-	fyne.Do(func() {
-		if a.DownloadList != nil {
-			a.DownloadList.Refresh()
-		}
-		if a.QueueCount != nil {
-			a.mu.Lock()
-			count := len(a.Items)
-			a.mu.Unlock()
-			a.QueueCount.SetText(fmt.Sprintf("📊 คิว: %d", count))
-		}
-	})
-}
-
 func (a *App) ShowURLDialog(item *DownloadItem) {
 	urlEntry := widget.NewEntry()
 	urlEntry.SetPlaceHolder("ใส่ URL ใหม่...")
 	urlEntry.Text = item.URL
 
+	errorLabel := widget.NewLabel("⚠️ " + item.Status)
+	errorLabel.Wrapping = fyne.TextWrapWord
+	errorLabel.TextStyle = fyne.TextStyle{Bold: true}
+	errorLabel.Importance = widget.DangerImportance
+
 	items := []*widget.FormItem{
+		widget.NewFormItem("", errorLabel),
 		widget.NewFormItem("URL ใหม่", urlEntry),
 	}
 
-	dialog.ShowForm("🔄 เปลี่ยน URL", "เปลี่ยน", "ยกเลิก", items,
+	dialog.ShowForm("🔄 เปลี่ยน URL", "เปลี่ยนและโหลดต่อ", "ยกเลิก", items,
 		func(ok bool) {
 			if ok {
 				newURL := urlEntry.Text
 				if newURL != "" && newURL != item.URL {
 					item.URL = newURL
 					item.Wrapper.URL = newURL
+					item.Wrapper.IsRetry = true
 					item.Status = "🔄 กำลังลองใหม่..."
 					a.UpdateUI()
+
+					time.Sleep(500 * time.Millisecond)
+					a.Wg.Add(1)
+					go a.startDownload(item)
+				} else if newURL == item.URL {
+					item.Status = "⏳ URL เดิม, ลองใหม่..."
+					a.UpdateUI()
+					a.Wg.Add(1)
 					go a.startDownload(item)
 				}
+			} else {
+				item.Status = "⏹️ รอผู้ใช้เปลี่ยน URL"
+				a.UpdateUI()
 			}
 		}, a.Window)
 }
 
 func main() {
-	// สร้างแอป
 	myApp := app.New()
 	myWindow := myApp.NewWindow("🎬 IDM Clone - ตัวโหลดวิดีโอ")
 	myWindow.Resize(fyne.NewSize(800, 500))
@@ -563,7 +602,6 @@ func main() {
 	appInstance := NewApp()
 	appInstance.Window = myWindow
 
-	// สร้าง UI Components
 	addBtn := widget.NewButtonWithIcon("➕ เพิ่ม URL", theme.ContentAddIcon(), func() {
 		appInstance.ShowAddDialog()
 	})
@@ -571,7 +609,6 @@ func main() {
 
 	appInstance.QueueCount = widget.NewLabel("📊 คิว: 0")
 
-	// สร้างรายการดาวน์โหลด
 	appInstance.DownloadList = widget.NewList(
 		func() int {
 			appInstance.mu.Lock()
@@ -579,7 +616,6 @@ func main() {
 			return len(appInstance.Items)
 		},
 		func() fyne.CanvasObject {
-			// Template สำหรับแต่ละรายการ
 			progressBar := widget.NewProgressBar()
 			progressBar.Min = 0
 			progressBar.Max = 100
@@ -591,7 +627,7 @@ func main() {
 				widget.NewButtonWithIcon("", theme.CancelIcon(), func() {}),
 				widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {}),
 				widget.NewButtonWithIcon("", theme.ConfirmIcon(), func() {}),
-				widget.NewButtonWithIcon("", theme.DocumentCreateIcon(), func() {}), // ✅ ปุ่มเปลี่ยนชื่อ
+				widget.NewButtonWithIcon("", theme.DocumentCreateIcon(), func() {}),
 			)
 
 			return container.NewVBox(
@@ -607,7 +643,6 @@ func main() {
 				),
 			)
 		},
-		// ในฟังก์ชัน Update CanvasObject
 		func(id int, obj fyne.CanvasObject) {
 			appInstance.mu.Lock()
 			defer appInstance.mu.Unlock()
@@ -628,7 +663,6 @@ func main() {
 			statusLabel := bottomBox.Objects[1].(*widget.Label)
 			btnContainer := bottomBox.Objects[2].(*fyne.Container)
 
-			// อัปเดตข้อมูล
 			title := item.Title
 			if len(title) > 35 {
 				title = title[:35] + "..."
@@ -649,7 +683,6 @@ func main() {
 			}
 			statusLabel.SetText(statusText)
 
-			// อัปเดตปุ่ม
 			cancelBtn := btnContainer.Objects[0].(*widget.Button)
 			cancelBtn.OnTapped = func() {
 				appInstance.CancelDownload(id)
@@ -665,7 +698,6 @@ func main() {
 				appInstance.ShowURLDialog(item)
 			}
 
-			// ✅ เพิ่มปุ่มเปลี่ยนชื่อ
 			renameBtn := btnContainer.Objects[3].(*widget.Button)
 			renameBtn.OnTapped = func() {
 				appInstance.ShowRenameDialog(item)
@@ -674,7 +706,6 @@ func main() {
 		},
 	)
 
-	// Layout
 	topBar := container.NewHBox(
 		addBtn,
 		widget.NewSeparator(),
@@ -693,7 +724,6 @@ func main() {
 
 	myWindow.SetContent(content)
 
-	// เริ่ม Goroutine สำหรับอัปเดต UI อัตโนมัติ
 	go func() {
 		for {
 			time.Sleep(500 * time.Millisecond)
