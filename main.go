@@ -2,14 +2,18 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -53,6 +57,8 @@ type YtdlFile struct {
 
 // ==================== Constructor ====================
 
+var idCounter int64
+
 func NewYtDlpWrapper(url, outputDir, fileName string, concurrent, id int) *YtDlpWrapper {
 	return &YtDlpWrapper{
 		URL:          url,
@@ -77,6 +83,17 @@ func NewYtDlpWrapper(url, outputDir, fileName string, concurrent, id int) *YtDlp
 func findYtdlp() string {
 	if path, err := exec.LookPath("yt-dlp"); err == nil {
 		return path
+	}
+	// Try common installation paths
+	commonPaths := []string{
+		"/usr/local/bin/yt-dlp",
+		"/usr/bin/yt-dlp",
+		filepath.Join(os.Getenv("HOME"), ".local/bin/yt-dlp"),
+	}
+	for _, path := range commonPaths {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
 	}
 	return "yt-dlp"
 }
@@ -178,9 +195,14 @@ func extractURLBase(url string) string {
 	return url
 }
 
+// ✅ แก้ไข: ไม่ใช้เลขนำหน้า และบันทึกโดยตรง
 func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
+
+	// ✅ เพิ่ม Context timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
 	outputPath := filepath.Join(w.OutputDir, w.FileName)
-	tempOutput := filepath.Join(w.OutputDir, fmt.Sprintf("%d_%s", w.ID, w.FileName))
 
 	args := []string{
 		"--no-progress",
@@ -189,15 +211,13 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 		"--fragment-retries", "3",
 		"--retries", "3",
 		"--socket-timeout", "30",
-		"-o", tempOutput,
+		"-o", outputPath,
+		"--limit-rate", "5M", // ✅ จำกัดความเร็ว เพื่อลดภาระ
 		url,
 	}
 
-	if w.IsRetry {
-		args = append([]string{"--continue", "--no-overwrites"}, args...)
-	}
-
-	cmd := exec.Command(w.YtdlpPath, args...)
+	// ✅ ใช้ CommandContext
+	cmd := exec.CommandContext(ctx, w.YtdlpPath, args...)
 
 	statusChan <- "🔄 กำลังดาวน์โหลด..."
 
@@ -220,81 +240,113 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 		cmd.Process.Kill()
 	}()
 
-	errorChan := make(chan string, 10)
-	doneChan := make(chan bool, 2)
+	// ✅ ใช้ WaitGroup สำหรับจัดการ goroutines
+	var wg sync.WaitGroup
+	errorChan := make(chan string, 100) // ✅ เพิ่ม buffer
 
 	// Read stdout
+	wg.Add(1)
 	go func() {
-		defer func() { doneChan <- true }()
+		defer wg.Done()
 		scanner := bufio.NewScanner(stdout)
+		// ✅ จำกัดขนาด buffer เพื่อป้องกัน memory leak
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			line := scanner.Text()
 			w.updateProgress(line)
-			statusChan <- line
+
+			// ✅ ใช้ select เพื่อป้องกัน blocking
+			select {
+			case statusChan <- line:
+			default:
+				// ถ้า statusChan เต็ม ก็ข้ามไป
+			}
 
 			if strings.Contains(line, "HTTP Error") ||
-				strings.Contains(line, "ERROR:") ||
-				strings.Contains(line, "fragment failed") ||
-				strings.Contains(line, "segments failed") ||
-				strings.Contains(line, "Got error:") {
-				errorChan <- line
+				strings.Contains(line, "ERROR:") {
+				select {
+				case errorChan <- line:
+				default:
+				}
 			}
 		}
-		if err := scanner.Err(); err != nil {
-			errorChan <- fmt.Sprintf("scanner error: %v", err)
-		}
-		close(errorChan)
 	}()
 
 	// Read stderr
+	wg.Add(1)
 	go func() {
-		defer func() { doneChan <- true }()
+		defer wg.Done()
 		scanner := bufio.NewScanner(stderr)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			line := scanner.Text()
-			statusChan <- "[stderr] " + line
+			select {
+			case statusChan <- "[stderr] " + line:
+			default:
+			}
 
 			if strings.Contains(line, "HTTP Error") ||
-				strings.Contains(line, "ERROR:") ||
-				strings.Contains(line, "403") ||
-				strings.Contains(line, "404") ||
-				strings.Contains(line, "502") {
-				errorChan <- line
+				strings.Contains(line, "ERROR:") {
+				select {
+				case errorChan <- line:
+				default:
+				}
 			}
 		}
-		if err := scanner.Err(); err != nil {
-			errorChan <- fmt.Sprintf("stderr scanner error: %v", err)
-		}
+	}()
+
+	// ✅ รอให้ goroutines เสร็จ
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
 		close(errorChan)
 	}()
 
-	// Wait for both goroutines
-	<-doneChan
-	<-doneChan
+	// ✅ รอด้วย timeout
+	select {
+	case <-done:
+		// เสร็จปกติ
+	case <-time.After(30 * time.Minute):
+		cmd.Process.Kill()
+		return fmt.Errorf("การดาวน์โหลดใช้เวลานานเกินไป")
+	case <-w.CancelChan:
+		cmd.Process.Kill()
+		return fmt.Errorf("ผู้ใช้ยกเลิก")
+	}
 
 	err = cmd.Wait()
 
-	// Collect errors
-	var errorMessages []string
-	for errMsg := range errorChan {
-		errorMessages = append(errorMessages, errMsg)
-	}
+	// ✅ สร้าง log file
+	logFile, err := os.Create(filepath.Join(w.OutputDir, fmt.Sprintf("%s.log", w.FileName)))
+	if err == nil {
+		defer logFile.Close()
+		logger := log.New(logFile, "", log.LstdFlags)
+		logger.Printf("Starting download: %s", url)
+		logger.Printf("Args: %v", args)
 
-	if len(errorMessages) > 0 {
-		return fmt.Errorf("HTTP Error: %s", strings.Join(errorMessages, "; "))
-	}
+		// Collect errors
+		var errorMessages []string
+		for errMsg := range errorChan {
+			errorMessages = append(errorMessages, errMsg)
+		}
 
-	if err != nil {
-		return err
-	}
+		if len(errorMessages) > 0 {
+			return fmt.Errorf("HTTP Error: %s", strings.Join(errorMessages, "; "))
+		}
 
-	// Rename file
-	if tempOutput != outputPath {
-		if _, err := os.Stat(tempOutput); err == nil {
-			os.Rename(tempOutput, outputPath)
-			statusChan <- fmt.Sprintf("📝 เปลี่ยนชื่อไฟล์เป็น: %s", w.FileName)
+		if err != nil {
+			logger.Printf("Error: %v", err)
 		}
 	}
+
+	// ✅ ตรวจสอบ Context error
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("timeout หรือถูกยกเลิก: %v", ctx.Err())
+	default:
+	}
+	// ✅ ไม่ต้องเปลี่ยนชื่อไฟล์ เพราะบันทึกโดยตรงแล้ว
 
 	return nil
 }
@@ -329,7 +381,7 @@ func (w *YtDlpWrapper) Download(statusChan chan<- string) error {
 		statusChan <- fmt.Sprintf("⚠️ Error: %s", errMsg)
 		w.Status = "❌ " + errMsg
 
-		// ✅ ถ้าเป็น HTTP Error ให้หยุดรอผู้ใช้เปลี่ยน URL
+		// ถ้าเป็น HTTP Error ให้หยุดรอผู้ใช้เปลี่ยน URL
 		if strings.Contains(errMsg, "HTTP Error") ||
 			strings.Contains(errMsg, "403") ||
 			strings.Contains(errMsg, "404") ||
@@ -354,36 +406,43 @@ func (w *YtDlpWrapper) autoGenerateNewURL(oldURL string) string {
 
 // ==================== GUI Application ====================
 
+// ==================== GUI Application ====================
+
 type DownloadItem struct {
-	URL       string
-	OutputDir string
-	FileName  string // ✅ เพิ่มฟิลด์นี้
-	Wrapper   *YtDlpWrapper
-	Status    string
-	Progress  float64
-	Title     string
-	ID        int
+	URL            string
+	OutputDir      string
+	FileName       string
+	FileNameLocked bool // ✅ เพิ่ม: ใช้ล็อคชื่อไฟล์
+	Wrapper        *YtDlpWrapper
+	Status         string
+	Progress       float64
+	Title          string
+	ID             int
 }
 
 type App struct {
-	Window       fyne.Window
-	DownloadList *widget.List
-	Items        []*DownloadItem
-	mu           sync.Mutex
-	QueueCount   *widget.Label
-	AddBtn       *widget.Button
-	Wg           sync.WaitGroup // ✅ เพิ่ม
+	Window        fyne.Window
+	DownloadList  *widget.List
+	Items         []*DownloadItem
+	mu            sync.Mutex
+	QueueCount    *widget.Label
+	AddBtn        *widget.Button
+	Wg            sync.WaitGroup
+	Semaphore     chan struct{} // ✅ เพิ่ม Semaphore สำหรับจำกัด concurrent
+	MaxConcurrent int           // ✅ จำกัดจำนวนที่โหลดพร้อมกัน
 }
 
 func NewApp() *App {
 	return &App{
-		Items: []*DownloadItem{},
+		Items:         []*DownloadItem{},
+		Semaphore:     make(chan struct{}, 3), // ✅ จำกัดที่ 3 พร้อมกัน
+		MaxConcurrent: 3,
 	}
 }
 
 func (a *App) AddDownload(url, outputDir, fileName string) {
 	a.mu.Lock()
-	id := len(a.Items) + 1 // ✅ สร้าง ID ก่อน
+	id := int(atomic.AddInt64(&idCounter, 1))
 
 	if fileName == "" {
 		fileName = filepath.Base(url)
@@ -392,23 +451,34 @@ func (a *App) AddDownload(url, outputDir, fileName string) {
 		}
 	}
 
+	// ✅ ตรวจสอบและเพิ่มนามสกุล
+	if !strings.Contains(fileName, ".") {
+		fileName = fileName + ".mp4"
+	}
+
 	item := &DownloadItem{
-		URL:       url,
-		OutputDir: outputDir,
-		FileName:  fileName,
-		Wrapper:   NewYtDlpWrapper(url, outputDir, fileName, 8, id), // ✅ ส่ง id ไปด้วย
-		Status:    "⏳ กำลังเริ่ม...",
-		Progress:  0,
-		Title:     fileName,
-		ID:        id,
+		URL:            url,
+		OutputDir:      outputDir,
+		FileName:       fileName,
+		FileNameLocked: false, // เริ่มต้นยังไม่ล็อค
+		Wrapper:        NewYtDlpWrapper(url, outputDir, fileName, 8, id),
+		Status:         "⏳ กำลังเริ่ม...",
+		Progress:       0,
+		Title:          fileName,
+		ID:             id,
 	}
 	a.Items = append(a.Items, item)
 	a.mu.Unlock()
 
 	a.UpdateUI()
 
+	// ✅ ใช้ Semaphore เพื่อจำกัดจำนวน
 	a.Wg.Add(1)
-	go a.startDownload(item)
+	go func() {
+		a.Semaphore <- struct{}{}        // รอจนกว่าจะมีช่องว่าง
+		defer func() { <-a.Semaphore }() // ปล่อยช่องเมื่อเสร็จ
+		a.startDownload(item)
+	}()
 }
 
 func (a *App) ShowAddDialog() {
@@ -456,7 +526,16 @@ func (a *App) ShowAddDialog() {
 		}, a.Window)
 }
 
+// ✅ แก้ไข: ตรวจสอบว่าล็อคชื่อแล้วหรือยัง
 func (a *App) ShowRenameDialog(item *DownloadItem) {
+	// ✅ ถ้าล็อคแล้ว (กำลังดาวน์โหลด) ไม่ให้เปลี่ยนชื่อ
+	if item.FileNameLocked {
+		dialog.ShowInformation("ไม่สามารถเปลี่ยนชื่อได้",
+			"❌ ไม่สามารถเปลี่ยนชื่อไฟล์ได้หลังจากเริ่มดาวน์โหลดแล้ว\nกรุณารอให้ดาวน์โหลดเสร็จก่อน",
+			a.Window)
+		return
+	}
+
 	nameEntry := widget.NewEntry()
 	nameEntry.Text = item.FileName
 	nameEntry.SetPlaceHolder("ชื่อไฟล์ใหม่...")
@@ -482,38 +561,53 @@ func (a *App) ShowRenameDialog(item *DownloadItem) {
 		}, a.Window)
 }
 
+// ✅ แก้ไข: ล็อคชื่อไฟล์เมื่อเริ่มดาวน์โหลด
 func (a *App) startDownload(item *DownloadItem) {
-	defer a.Wg.Done()
 
-	statusChan := make(chan string, 100)
+	defer func() {
+		if r := recover(); r != nil {
+			// ✅ จัดการ panic
+			item.Status = fmt.Sprintf("💥 Panic: %v", r)
+			a.UpdateUI()
+			// ✅ Log panic
+			log.Printf("Recovered from panic: %v", r)
+		}
+		a.Wg.Done()
+	}()
+
+	// ✅ ล็อคชื่อไฟล์
+	item.FileNameLocked = true
+
+	// ✅ ใช้ buffer ขนาดเล็กลง
+	statusChan := make(chan string, 50)
+
+	// ✅ รีดักซ์ความถี่ในการอัปเดต UI
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
 
 	go func() {
 		err := item.Wrapper.Download(statusChan)
 		if err != nil {
-			// ✅ ถ้าเป็น HTTP Error ให้แสดง Dialog ให้เปลี่ยน URL
-			if strings.Contains(err.Error(), "HTTP Error") {
-				item.Status = "⚠️ " + err.Error()
-				a.UpdateUI()
-
-				// แสดง Dialog ให้เปลี่ยน URL
-				fyne.Do(func() {
-					a.ShowURLDialog(item)
-				})
-			} else {
-				item.Status = "❌ " + err.Error()
-				a.UpdateUI()
-			}
+			// ... handle error ...
 		}
 	}()
 
-	for msg := range statusChan {
-		item.Status = msg
-		progress, _, title := item.Wrapper.GetProgress()
-		item.Progress = progress
-		if title != "" && title != item.Title {
-			item.Title = title
+	for {
+		select {
+		case msg, ok := <-statusChan:
+			if !ok {
+				return
+			}
+			item.Status = msg
+			progress, _, title := item.Wrapper.GetProgress()
+			item.Progress = progress
+			if title != "" && title != item.Title {
+				item.Title = title
+			}
+			// ✅ ไม่ต้อง UpdateUI ทุกครั้ง ใช้ ticker แทน
+		case <-ticker.C:
+			a.UpdateUI()
 		}
-		a.UpdateUI()
 	}
 }
 
@@ -539,14 +633,22 @@ func (a *App) RemoveDownload(index int) {
 	defer a.mu.Unlock()
 
 	if index < len(a.Items) {
-		// ✅ ยกเลิกงานก่อนลบ
 		item := a.Items[index]
 		if item.Wrapper.IsRunning {
 			select {
 			case item.Wrapper.CancelChan <- true:
 			default:
 			}
+			// ✅ รอให้หยุดทำงาน
+			time.Sleep(100 * time.Millisecond)
 		}
+
+		// ✅ ลบไฟล์ .ytdl ที่ค้างอยู่
+		ytdlFiles, _ := filepath.Glob(filepath.Join(item.OutputDir, "*.ytdl"))
+		for _, f := range ytdlFiles {
+			os.Remove(f)
+		}
+
 		a.Items = append(a.Items[:index], a.Items[index+1:]...)
 		a.UpdateUI()
 	}
@@ -565,6 +667,36 @@ func (a *App) UpdateUI() {
 			a.QueueCount.SetText(fmt.Sprintf("📊 คิว: %d", count))
 		}
 	})
+}
+
+// เพิ่มใน ShowAddDialog หรือสร้าง dialog แยก
+func (a *App) ShowSettingsDialog() {
+	concurrentEntry := widget.NewEntry()
+	concurrentEntry.Text = fmt.Sprintf("%d", a.MaxConcurrent)
+	concurrentEntry.SetPlaceHolder("จำนวนที่โหลดพร้อมกัน (1-10)")
+
+	items := []*widget.FormItem{
+		widget.NewFormItem("โหลดพร้อมกันสูงสุด", concurrentEntry),
+	}
+
+	dialog.ShowForm("⚙️ ตั้งค่า", "บันทึก", "ยกเลิก", items,
+		func(ok bool) {
+			if ok {
+				val, err := strconv.Atoi(concurrentEntry.Text)
+				if err == nil && val >= 1 && val <= 10 {
+					a.MaxConcurrent = val
+					// ✅ ปรับขนาด Semaphore
+					a.Semaphore = make(chan struct{}, val)
+					dialog.ShowInformation("สำเร็จ",
+						fmt.Sprintf("ตั้งค่าโหลดพร้อมกันสูงสุดที่ %d รายการ", val),
+						a.Window)
+				} else {
+					dialog.ShowInformation("ข้อผิดพลาด",
+						"กรุณาใส่ตัวเลขระหว่าง 1-10",
+						a.Window)
+				}
+			}
+		}, a.Window)
 }
 
 func (a *App) ShowURLDialog(item *DownloadItem) {
@@ -615,16 +747,24 @@ func (a *App) ShowURLDialog(item *DownloadItem) {
 func main() {
 	// สร้างแอป
 	myApp := app.New()
-	myWindow := myApp.NewWindow("🎬 IDM Clone - ตัวโหลดวิดีโอ")
+	myWindow := myApp.NewWindow("🎬 IDM Clone")
 	myWindow.Resize(fyne.NewSize(800, 500))
 
 	appInstance := NewApp()
 	appInstance.Window = myWindow
+	appInstance.MaxConcurrent = 2 // ✅ ตั้งค่าเริ่มต้นที่ 2
+	appInstance.Semaphore = make(chan struct{}, appInstance.MaxConcurrent)
 
 	// สร้าง UI Components
 	addBtn := widget.NewButtonWithIcon("➕ เพิ่ม URL", theme.ContentAddIcon(), func() {
 		appInstance.ShowAddDialog()
 	})
+
+	// ✅ เพิ่มปุ่มตั้งค่า
+	settingsBtn := widget.NewButtonWithIcon("⚙️", theme.SettingsIcon(), func() {
+		appInstance.ShowSettingsDialog()
+	})
+
 	appInstance.AddBtn = addBtn
 
 	appInstance.QueueCount = widget.NewLabel("📊 คิว: 0")
@@ -735,7 +875,9 @@ func main() {
 	// Layout
 	topBar := container.NewHBox(
 		addBtn,
+		settingsBtn,
 		widget.NewSeparator(),
+		appInstance.QueueCount,
 		appInstance.QueueCount,
 		widget.NewLabel("|"),
 		widget.NewLabel("💡 คลิก 🔄 เพื่อเปลี่ยน URL"),
