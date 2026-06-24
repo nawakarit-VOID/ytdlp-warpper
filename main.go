@@ -12,23 +12,33 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gen2brain/dlgs"
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
 )
 
-// ==================== ตัวจัดการต่อ 1 วิดีโอ ====================
+// ==================== Core Downloader ====================
+
 type YtDlpWrapper struct {
 	URL          string
 	OutputDir    string
+	FileName     string // ✅ เพิ่มฟิลด์นี้
 	Concurrent   int
 	RetryCount   int
 	YtdlpPath    string
 	IsRetry      bool
 	URLHistory   []string
 	mu           sync.Mutex
-	Progress     float64 // 0-100
+	Progress     float64
 	Status       string
 	SegmentCount int
 	DoneSegments int
+	Title        string
+	CancelChan   chan bool
+	IsRunning    bool
 }
 
 type YtdlFile struct {
@@ -40,19 +50,23 @@ type YtdlFile struct {
 	URL string `json:"url"`
 }
 
-func NewYtDlpWrapper(url, outputDir string, concurrent int) *YtDlpWrapper {
+func NewYtDlpWrapper(url, outputDir, fileName string, concurrent int) *YtDlpWrapper {
 	return &YtDlpWrapper{
 		URL:          url,
 		OutputDir:    outputDir,
+		FileName:     fileName,
 		Concurrent:   concurrent,
 		RetryCount:   0,
 		IsRetry:      false,
 		YtdlpPath:    findYtdlp(),
 		URLHistory:   []string{url},
 		Progress:     0,
-		Status:       "pending",
+		Status:       "⏳ รอเริ่ม",
 		SegmentCount: 0,
 		DoneSegments: 0,
+		Title:        fileName,
+		CancelChan:   make(chan bool, 1),
+		IsRunning:    false,
 	}
 }
 
@@ -67,7 +81,6 @@ func (w *YtDlpWrapper) updateProgress(line string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// ดึงจำนวน segment ทั้งหมด
 	if strings.Contains(line, "Downloading") && strings.Contains(line, "fragments") {
 		re := regexp.MustCompile(`(\d+)\s+fragments`)
 		if matches := re.FindStringSubmatch(line); len(matches) > 1 {
@@ -75,7 +88,6 @@ func (w *YtDlpWrapper) updateProgress(line string) {
 		}
 	}
 
-	// ดึง segment ที่กำลังโหลด
 	if strings.Contains(line, "fragment") {
 		re := regexp.MustCompile(`fragment\s+(\d+)`)
 		if matches := re.FindStringSubmatch(line); len(matches) > 1 {
@@ -86,47 +98,30 @@ func (w *YtDlpWrapper) updateProgress(line string) {
 		}
 	}
 
-	// ตรวจจับสถานะ
 	if strings.Contains(line, "Merging") {
-		w.Status = "merging"
+		w.Status = "🔄 กำลังรวมไฟล์..."
 	}
-	if strings.Contains(line, "100%") {
+	if strings.Contains(line, "100%") || strings.Contains(line, "Merging completed") {
 		w.Progress = 100
-		w.Status = "done"
+		w.Status = "✅ เสร็จ!"
 	}
-	if strings.Contains(line, "ERROR") || strings.Contains(line, "502") {
-		w.Status = "error"
+	if strings.Contains(line, "ERROR") || strings.Contains(line, "502") || strings.Contains(line, "403") {
+		w.Status = "❌ Error: " + line
 	}
-}
 
-func (w *YtDlpWrapper) GetProgress() (float64, string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.Progress, w.Status
-}
-
-func showURLDialogWithHistory(oldURL string, errorMsg string, history []string) (string, bool) {
-	historyText := ""
-	if len(history) > 1 {
-		historyText = "\n📜 ประวัติ URL ที่ลองแล้ว:\n"
-		for i, u := range history {
-			historyText += fmt.Sprintf("  %d. %s\n", i+1, u)
+	// ดึงชื่อวิดีโอ
+	if strings.Contains(line, "[download]") && strings.Contains(line, ".mp4") {
+		re := regexp.MustCompile(`\[download\]\s+(.+?\.mp4)`)
+		if matches := re.FindStringSubmatch(line); len(matches) > 1 {
+			w.Title = matches[1]
 		}
 	}
+}
 
-	message := fmt.Sprintf(
-		"URL ปัจจุบัน: %s\n\nError: %s\n%s\n\nกรุณาใส่ URL ใหม่:",
-		oldURL,
-		errorMsg,
-		historyText,
-	)
-
-	newURL, ok, err := dlgs.Entry("🔄 เปลี่ยน URL", message, oldURL)
-	if err != nil {
-		fmt.Printf("Error showing dialog: %v\n", err)
-		return "", false
-	}
-	return newURL, ok
+func (w *YtDlpWrapper) GetProgress() (float64, string, string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.Progress, w.Status, w.Title
 }
 
 func (w *YtDlpWrapper) findYtdlFile() (string, error) {
@@ -179,8 +174,10 @@ func extractURLBase(url string) string {
 	return url
 }
 
-// runYtdlp รัน yt-dlp สำหรับ 1 วิดีโอ
-func (w *YtDlpWrapper) runYtdlp(url string) error {
+func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
+	// 🔥 ใช้ชื่อไฟล์ที่ผู้ใช้ตั้ง
+	outputPath := filepath.Join(w.OutputDir, w.FileName)
+
 	args := []string{
 		"--no-progress",
 		"--newline",
@@ -188,7 +185,7 @@ func (w *YtDlpWrapper) runYtdlp(url string) error {
 		"--fragment-retries", "5",
 		"--retries", "3",
 		"--socket-timeout", "30",
-		"-o", filepath.Join(w.OutputDir, "%(title)s.%(ext)s"),
+		"-o", outputPath, // ✅ ใช้ชื่อที่ผู้ใช้ตั้ง
 		url,
 	}
 
@@ -198,7 +195,7 @@ func (w *YtDlpWrapper) runYtdlp(url string) error {
 
 	cmd := exec.Command(w.YtdlpPath, args...)
 
-	fmt.Printf("\n📥 [%s] เริ่มดาวน์โหลด...\n", w.OutputDir)
+	statusChan <- "🔄 กำลังดาวน์โหลด..."
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -214,14 +211,15 @@ func (w *YtDlpWrapper) runYtdlp(url string) error {
 	}
 
 	errorChan := make(chan string, 10)
+	doneChan := make(chan bool, 2)
 
 	// อ่าน stdout
 	go func() {
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
 			line := scanner.Text()
-			fmt.Printf("[%s] %s\n", w.OutputDir, line)
 			w.updateProgress(line)
+			statusChan <- line
 
 			if strings.Contains(line, "HTTP Error 502") ||
 				strings.Contains(line, "HTTP Error 403") ||
@@ -234,13 +232,15 @@ func (w *YtDlpWrapper) runYtdlp(url string) error {
 		if err := scanner.Err(); err != nil {
 			errorChan <- fmt.Sprintf("scanner error: %v", err)
 		}
+		doneChan <- true
 	}()
 
+	// อ่าน stderr
 	go func() {
 		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
 			line := scanner.Text()
-			fmt.Printf("[%s][stderr] %s\n", w.OutputDir, line)
+			statusChan <- "[stderr] " + line
 			if strings.Contains(line, "502") || strings.Contains(line, "403") {
 				errorChan <- line
 			}
@@ -248,7 +248,17 @@ func (w *YtDlpWrapper) runYtdlp(url string) error {
 		if err := scanner.Err(); err != nil {
 			errorChan <- fmt.Sprintf("stderr scanner error: %v", err)
 		}
+		doneChan <- true
 	}()
+
+	// รอให้ goroutine จบ หรือยกเลิก
+	select {
+	case <-w.CancelChan:
+		cmd.Process.Kill()
+		return fmt.Errorf("ผู้ใช้ยกเลิก")
+	case <-doneChan:
+		<-doneChan
+	}
 
 	err = cmd.Wait()
 
@@ -265,262 +275,431 @@ func (w *YtDlpWrapper) runYtdlp(url string) error {
 	return nil
 }
 
-// Download ดาวน์โหลด 1 วิดีโอ (มี loop retry)
-func (w *YtDlpWrapper) Download() error {
+func (w *YtDlpWrapper) Download(statusChan chan<- string) error {
 	currentURL := w.URL
 	attempt := 0
+	w.IsRunning = true
+	defer func() { w.IsRunning = false }()
 
 	for {
 		attempt++
-		fmt.Printf("\n🔄 [%s] รอบที่ %d\n", w.OutputDir, attempt)
+		statusChan <- fmt.Sprintf("🔄 รอบที่ %d", attempt)
 
-		err := w.runYtdlp(currentURL)
+		err := w.runYtdlp(currentURL, statusChan)
 
 		if err == nil {
-			w.Status = "done"
 			w.Progress = 100
-			fmt.Printf("✅ [%s] ดาวน์โหลดเสร็จ!\n", w.OutputDir)
+			w.Status = "✅ เสร็จ!"
+			statusChan <- "✅ ดาวน์โหลดเสร็จ!"
 			return nil
 		}
 
-		fmt.Printf("⚠️ [%s] Error: %v\n", w.OutputDir, err)
-		w.Status = "error"
+		// ตรวจสอบว่าถูกยกเลิก
+		select {
+		case <-w.CancelChan:
+			return fmt.Errorf("ผู้ใช้ยกเลิก")
+		default:
+		}
+
+		statusChan <- fmt.Sprintf("⚠️ Error: %v", err)
+		w.Status = "❌ Error"
 
 		ytdlFile, _ := w.findYtdlFile()
 		if ytdlFile != "" {
-			fmt.Printf("📄 [%s] พบไฟล์ .ytdl\n", w.OutputDir)
+			statusChan <- "📄 พบไฟล์ .ytdl"
 		}
 
-		newURL, ok := showURLDialogWithHistory(
-			currentURL,
-			fmt.Sprintf("%v (รอบที่ %d)", err, attempt),
-			w.URLHistory,
-		)
-
-		if !ok || newURL == "" {
-			fmt.Printf("❌ [%s] ผู้ใช้ยกเลิก\n", w.OutputDir)
-			return fmt.Errorf("ผู้ใช้ยกเลิก")
-		}
-
-		if newURL == currentURL {
-			fmt.Printf("ℹ️ [%s] URL ไม่เปลี่ยนแปลง\n", w.OutputDir)
-			time.Sleep(2 * time.Second)
+		// เปลี่ยน URL อัตโนมัติ (ถ้ารู้รูปแบบ)
+		newURL := w.autoGenerateNewURL(currentURL)
+		if newURL != "" && newURL != currentURL {
+			statusChan <- fmt.Sprintf("🔄 เปลี่ยน URL อัตโนมัติ: %s", newURL)
+			if ytdlFile != "" {
+				oldBase := extractURLBase(currentURL)
+				newBase := extractURLBase(newURL)
+				if oldBase != newBase {
+					w.updateYtdlFile(ytdlFile, oldBase, newBase)
+				}
+			}
+			w.URLHistory = append(w.URLHistory, newURL)
+			currentURL = newURL
+			w.IsRetry = true
 			continue
 		}
 
-		if ytdlFile != "" {
-			oldBase := extractURLBase(currentURL)
-			newBase := extractURLBase(newURL)
-			if oldBase != newBase {
-				w.updateYtdlFile(ytdlFile, oldBase, newBase)
-			}
-		}
-
-		w.URLHistory = append(w.URLHistory, newURL)
-		currentURL = newURL
-		w.IsRetry = true
+		statusChan <- "⏸️ รอผู้ใช้ป้อน URL ใหม่..."
+		return fmt.Errorf("รอ URL ใหม่: %v", err)
 	}
 }
 
-// ==================== Worker Pool สำหรับหลายวิดีโอ ====================
+func (w *YtDlpWrapper) autoGenerateNewURL(oldURL string) string {
+	// ตัวอย่าง: ถ้า URL เปลี่ยนแค่ token หรือ timestamp
+	// ตรงนี้คุณสามารถเขียน logic ของคุณเอง
+	return ""
+}
 
-type DownloadJob struct {
+// ==================== GUI Application ====================
+
+// ==================== GUI Application ====================
+
+type DownloadItem struct {
 	URL       string
 	OutputDir string
+	FileName  string // ✅ เพิ่มฟิลด์นี้
+	Wrapper   *YtDlpWrapper
+	Status    string
+	Progress  float64
+	Title     string
 	ID        int
 }
 
-type DownloadResult struct {
-	ID      int
-	URL     string
-	Success bool
-	Error   error
+type App struct {
+	Window       fyne.Window
+	DownloadList *widget.List
+	Items        []*DownloadItem
+	mu           sync.Mutex
+	QueueCount   *widget.Label
+	AddBtn       *widget.Button
 }
 
-// WorkerPool จัดการการดาวน์โหลดหลายวิดีโอพร้อมกัน
-type WorkerPool struct {
-	NumWorkers int
-	Concurrent int // ต่อวิดีโอ
-	Jobs       chan DownloadJob
-	Results    chan DownloadResult
-	Wg         sync.WaitGroup
-}
-
-func NewWorkerPool(numWorkers, concurrent int) *WorkerPool {
-	return &WorkerPool{
-		NumWorkers: numWorkers,
-		Concurrent: concurrent,
-		Jobs:       make(chan DownloadJob, 100),
-		Results:    make(chan DownloadResult, 100),
+func NewApp() *App {
+	return &App{
+		Items: []*DownloadItem{},
 	}
 }
 
-func (p *WorkerPool) Start() {
-	for i := 0; i < p.NumWorkers; i++ {
-		p.Wg.Add(1)
-		go p.worker(i)
-	}
-}
+func (a *App) AddDownload(url, outputDir, fileName string) {
+	a.mu.Lock()
+	id := len(a.Items) + 1
 
-func (p *WorkerPool) worker(id int) {
-	defer p.Wg.Done()
-	fmt.Printf("🧵 Worker %d เริ่มทำงาน\n", id)
-
-	for job := range p.Jobs {
-		fmt.Printf("\n🚀 Worker %d: กำลังโหลด %s\n", id, job.URL)
-
-		wrapper := NewYtDlpWrapper(job.URL, job.OutputDir, p.Concurrent)
-		err := wrapper.Download()
-
-		result := DownloadResult{
-			ID:      job.ID,
-			URL:     job.URL,
-			Success: err == nil,
-			Error:   err,
-		}
-		p.Results <- result
-
-		if err == nil {
-			fmt.Printf("✅ Worker %d: โหลด %s สำเร็จ!\n", id, job.URL)
-		} else {
-			fmt.Printf("❌ Worker %d: โหลด %s ล้มเหลว: %v\n", id, job.URL, err)
+	if fileName == "" {
+		fileName = filepath.Base(url)
+		if strings.HasSuffix(fileName, ".m3u8") {
+			fileName = strings.TrimSuffix(fileName, ".m3u8") + ".mp4"
 		}
 	}
-}
 
-func (p *WorkerPool) AddJob(url, outputDir string, id int) {
-	p.Jobs <- DownloadJob{
+	item := &DownloadItem{
 		URL:       url,
 		OutputDir: outputDir,
+		FileName:  fileName,
+		Wrapper:   NewYtDlpWrapper(url, outputDir, fileName, 8),
+		Status:    "⏳ กำลังเริ่ม...",
+		Progress:  0,
+		Title:     fileName,
 		ID:        id,
 	}
+	a.Items = append(a.Items, item)
+	a.mu.Unlock()
+
+	a.UpdateUI()
+	go a.startDownload(item)
 }
 
-func (p *WorkerPool) Wait() {
-	close(p.Jobs)
-	p.Wg.Wait()
-	close(p.Results)
+func (a *App) ShowAddDialog() {
+	urlEntry := widget.NewEntry()
+	urlEntry.SetPlaceHolder("ใส่ URL วิดีโอ...")
+
+	fileNameEntry := widget.NewEntry()
+	fileNameEntry.SetPlaceHolder("ชื่อไฟล์ (ไม่ต้องใส่นามสกุล)")
+
+	outputEntry := widget.NewEntry()
+	outputEntry.SetPlaceHolder("โฟลเดอร์ปลายทาง (ค่าเริ่มต้น: ./downloads)")
+	outputEntry.Text = "./downloads"
+
+	items := []*widget.FormItem{
+		widget.NewFormItem("URL", urlEntry),
+		widget.NewFormItem("ชื่อไฟล์", fileNameEntry),
+		widget.NewFormItem("Output", outputEntry),
+	}
+
+	dialog.ShowForm("➕ เพิ่มวิดีโอ", "เพิ่ม", "ยกเลิก", items,
+		func(ok bool) {
+			if ok {
+				url := urlEntry.Text
+				fileName := fileNameEntry.Text
+				output := outputEntry.Text
+
+				if output == "" {
+					output = "./downloads"
+				}
+
+				if fileName == "" {
+					fileName = filepath.Base(url)
+					if strings.HasSuffix(fileName, ".m3u8") {
+						fileName = strings.TrimSuffix(fileName, ".m3u8") + ".mp4"
+					}
+				}
+
+				if !strings.Contains(fileName, ".") {
+					fileName = fileName + ".mp4"
+				}
+
+				os.MkdirAll(output, 0755)
+				a.AddDownload(url, output, fileName)
+			}
+		}, a.Window)
 }
 
-// ==================== Main ====================
+func (a *App) ShowRenameDialog(item *DownloadItem) {
+	nameEntry := widget.NewEntry()
+	nameEntry.Text = item.FileName
+	nameEntry.SetPlaceHolder("ชื่อไฟล์ใหม่...")
 
-func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("📖 วิธีใช้งาน:")
-		fmt.Printf("  %s <URL> [output_dir]          - โหลดทีละตัว\n", os.Args[0])
-		fmt.Printf("  %s -batch <file> [workers]     - โหลดหลายตัวจากไฟล์\n", os.Args[0])
-		fmt.Println("\n📄 ไฟล์ batch: แต่ละบรรทัดคือ URL และ output_dir (คั่นด้วย space)")
-		fmt.Println("   Example: https://video1.com/m3u8 ./videos1")
-		fmt.Println("   Example: https://video2.com/m3u8 ./videos2")
-		os.Exit(1)
+	items := []*widget.FormItem{
+		widget.NewFormItem("ชื่อไฟล์ใหม่", nameEntry),
 	}
 
-	// โหมดเดี่ยว (Single)
-	if os.Args[1] != "-batch" {
-		url := os.Args[1]
-		outputDir := "."
-		if len(os.Args) > 2 {
-			outputDir = os.Args[2]
-		}
-		os.MkdirAll(outputDir, 0755)
+	dialog.ShowForm("✏️ เปลี่ยนชื่อไฟล์", "เปลี่ยน", "ยกเลิก", items,
+		func(ok bool) {
+			if ok {
+				newName := nameEntry.Text
+				if newName != "" && newName != item.FileName {
+					if !strings.Contains(newName, ".") {
+						newName = newName + ".mp4"
+					}
+					item.FileName = newName
+					item.Title = newName
+					item.Wrapper.FileName = newName
+					a.UpdateUI()
+				}
+			}
+		}, a.Window)
+}
 
-		wrapper := NewYtDlpWrapper(url, outputDir, 8)
-		if err := wrapper.Download(); err != nil {
-			fmt.Printf("❌ %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println("\n🎉 โหลดเสร็จเรียบร้อย!")
-		os.Exit(0)
-	}
+func (a *App) startDownload(item *DownloadItem) {
+	statusChan := make(chan string, 100)
 
-	// โหมด Batch (หลายวิดีโอ)
-	if len(os.Args) < 3 {
-		fmt.Println("❌ ต้องระบุไฟล์ batch")
-		os.Exit(1)
-	}
-
-	batchFile := os.Args[2]
-	numWorkers := 3 // ค่าเริ่มต้น
-	if len(os.Args) > 3 {
-		fmt.Sscanf(os.Args[3], "%d", &numWorkers)
-	}
-
-	// อ่านไฟล์ batch
-	data, err := os.ReadFile(batchFile)
-	if err != nil {
-		fmt.Printf("❌ อ่านไฟล์ไม่ได้: %v\n", err)
-		os.Exit(1)
-	}
-
-	lines := strings.Split(string(data), "\n")
-	jobs := []DownloadJob{}
-	for i, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.Fields(line)
-		if len(parts) < 1 {
-			continue
-		}
-		url := parts[0]
-		outputDir := "."
-		if len(parts) > 1 {
-			outputDir = parts[1]
-		}
-		os.MkdirAll(outputDir, 0755)
-
-		jobs = append(jobs, DownloadJob{
-			URL:       url,
-			OutputDir: outputDir,
-			ID:        i + 1,
-		})
-	}
-
-	if len(jobs) == 0 {
-		fmt.Println("❌ ไม่พบ URL ในไฟล์ batch")
-		os.Exit(1)
-	}
-
-	fmt.Printf("📊 พบ %d วิดีโอ, ใช้ %d worker\n", len(jobs), numWorkers)
-
-	// สร้าง Worker Pool
-	pool := NewWorkerPool(numWorkers, 8)
-	pool.Start()
-
-	// ส่งงาน
-	for _, job := range jobs {
-		pool.AddJob(job.URL, job.OutputDir, job.ID)
-	}
-
-	// รอผล
 	go func() {
-		pool.Wait()
+		err := item.Wrapper.Download(statusChan)
+		if err != nil {
+			item.Status = "❌ " + err.Error()
+			a.UpdateUI()
+		}
 	}()
 
-	// แสดงผลลัพธ์แบบ real-time
-	successCount := 0
-	failCount := 0
-	for result := range pool.Results {
-		if result.Success {
-			successCount++
-			fmt.Printf("✅ [Job %d] สำเร็จ\n", result.ID)
-		} else {
-			failCount++
-			fmt.Printf("❌ [Job %d] ล้มเหลว: %v\n", result.ID, result.Error)
+	for msg := range statusChan {
+		item.Status = msg
+		progress, _, title := item.Wrapper.GetProgress()
+		item.Progress = progress
+		if title != "" && title != item.Title {
+			item.Title = title
 		}
-		fmt.Printf("📊 ความคืบหน้า: %d/%d (สำเร็จ %d, ล้มเหลว %d)\n",
-			successCount+failCount, len(jobs), successCount, failCount)
+		a.UpdateUI()
 	}
-
-	fmt.Printf("\n🎉 สรุป: สำเร็จ %d, ล้มเหลว %d\n", successCount, failCount)
 }
 
-/*
+func (a *App) CancelDownload(index int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
-go run main.go "url"	โหลดทีละ 1 ตัว
-go run main.go "url1" "url2" "url3"	โหลด 3 ตัวพร้อมกัน
-go run main.go -batch videos.txt	โหลดจากไฟล์ batch
-go run main.go -batch videos.txt 5	โหลดจากไฟล์ batch ใช้ 5 workers
+	if index < len(a.Items) {
+		item := a.Items[index]
+		if item.Wrapper.IsRunning {
+			select {
+			case item.Wrapper.CancelChan <- true:
+			default:
+			}
+			item.Status = "⏹️ ยกเลิกแล้ว"
+			a.UpdateUI()
+		}
+	}
+}
 
-*/
+func (a *App) RemoveDownload(index int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if index < len(a.Items) {
+		a.Items = append(a.Items[:index], a.Items[index+1:]...)
+		a.UpdateUI()
+	}
+}
+
+func (a *App) UpdateUI() {
+	// ใช้ fyne.Do() เพื่ออัปเดต UI ใน Main Thread
+	fyne.Do(func() {
+		if a.DownloadList != nil {
+			a.DownloadList.Refresh()
+		}
+		if a.QueueCount != nil {
+			a.mu.Lock()
+			count := len(a.Items)
+			a.mu.Unlock()
+			a.QueueCount.SetText(fmt.Sprintf("📊 คิว: %d", count))
+		}
+	})
+}
+
+func (a *App) ShowURLDialog(item *DownloadItem) {
+	urlEntry := widget.NewEntry()
+	urlEntry.SetPlaceHolder("ใส่ URL ใหม่...")
+	urlEntry.Text = item.URL
+
+	items := []*widget.FormItem{
+		widget.NewFormItem("URL ใหม่", urlEntry),
+	}
+
+	dialog.ShowForm("🔄 เปลี่ยน URL", "เปลี่ยน", "ยกเลิก", items,
+		func(ok bool) {
+			if ok {
+				newURL := urlEntry.Text
+				if newURL != "" && newURL != item.URL {
+					item.URL = newURL
+					item.Wrapper.URL = newURL
+					item.Status = "🔄 กำลังลองใหม่..."
+					a.UpdateUI()
+					go a.startDownload(item)
+				}
+			}
+		}, a.Window)
+}
+
+func main() {
+	// สร้างแอป
+	myApp := app.New()
+	myWindow := myApp.NewWindow("🎬 IDM Clone - ตัวโหลดวิดีโอ")
+	myWindow.Resize(fyne.NewSize(800, 500))
+
+	appInstance := NewApp()
+	appInstance.Window = myWindow
+
+	// สร้าง UI Components
+	addBtn := widget.NewButtonWithIcon("➕ เพิ่ม URL", theme.ContentAddIcon(), func() {
+		appInstance.ShowAddDialog()
+	})
+	appInstance.AddBtn = addBtn
+
+	appInstance.QueueCount = widget.NewLabel("📊 คิว: 0")
+
+	// สร้างรายการดาวน์โหลด
+	appInstance.DownloadList = widget.NewList(
+		func() int {
+			appInstance.mu.Lock()
+			defer appInstance.mu.Unlock()
+			return len(appInstance.Items)
+		},
+		func() fyne.CanvasObject {
+			// Template สำหรับแต่ละรายการ
+			progressBar := widget.NewProgressBar()
+			progressBar.Min = 0
+			progressBar.Max = 100
+			titleLabel := widget.NewLabel("ชื่อวิดีโอ")
+			statusLabel := widget.NewLabel("สถานะ")
+			urlLabel := widget.NewLabel("URL")
+
+			btnContainer := container.NewHBox(
+				widget.NewButtonWithIcon("", theme.CancelIcon(), func() {}),
+				widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {}),
+				widget.NewButtonWithIcon("", theme.ConfirmIcon(), func() {}),
+				widget.NewButtonWithIcon("", theme.DocumentCreateIcon(), func() {}), // ✅ ปุ่มเปลี่ยนชื่อ
+			)
+
+			return container.NewVBox(
+				container.NewHBox(
+					titleLabel,
+					widget.NewLabel("|"),
+					urlLabel,
+				),
+				container.NewHBox(
+					progressBar,
+					statusLabel,
+					btnContainer,
+				),
+			)
+		},
+		// ในฟังก์ชัน Update CanvasObject
+		func(id int, obj fyne.CanvasObject) {
+			appInstance.mu.Lock()
+			defer appInstance.mu.Unlock()
+
+			if id >= len(appInstance.Items) {
+				return
+			}
+
+			item := appInstance.Items[id]
+			container := obj.(*fyne.Container)
+			topBox := container.Objects[0].(*fyne.Container)
+			bottomBox := container.Objects[1].(*fyne.Container)
+
+			titleLabel := topBox.Objects[0].(*widget.Label)
+			urlLabel := topBox.Objects[2].(*widget.Label)
+
+			progressBar := bottomBox.Objects[0].(*widget.ProgressBar)
+			statusLabel := bottomBox.Objects[1].(*widget.Label)
+			btnContainer := bottomBox.Objects[2].(*fyne.Container)
+
+			// อัปเดตข้อมูล
+			title := item.Title
+			if len(title) > 35 {
+				title = title[:35] + "..."
+			}
+			titleLabel.SetText("📹 " + title)
+
+			url := item.URL
+			if len(url) > 40 {
+				url = url[:40] + "..."
+			}
+			urlLabel.SetText(url)
+
+			progressBar.SetValue(item.Progress)
+
+			statusText := item.Status
+			if len(statusText) > 50 {
+				statusText = statusText[:50] + "..."
+			}
+			statusLabel.SetText(statusText)
+
+			// อัปเดตปุ่ม
+			cancelBtn := btnContainer.Objects[0].(*widget.Button)
+			cancelBtn.OnTapped = func() {
+				appInstance.CancelDownload(id)
+			}
+
+			removeBtn := btnContainer.Objects[1].(*widget.Button)
+			removeBtn.OnTapped = func() {
+				appInstance.RemoveDownload(id)
+			}
+
+			changeURLBtn := btnContainer.Objects[2].(*widget.Button)
+			changeURLBtn.OnTapped = func() {
+				appInstance.ShowURLDialog(item)
+			}
+
+			// ✅ เพิ่มปุ่มเปลี่ยนชื่อ
+			renameBtn := btnContainer.Objects[3].(*widget.Button)
+			renameBtn.OnTapped = func() {
+				appInstance.ShowRenameDialog(item)
+			}
+			renameBtn.Icon = theme.DocumentCreateIcon()
+		},
+	)
+
+	// Layout
+	topBar := container.NewHBox(
+		addBtn,
+		widget.NewSeparator(),
+		appInstance.QueueCount,
+		widget.NewLabel("|"),
+		widget.NewLabel("💡 คลิก 🔄 เพื่อเปลี่ยน URL"),
+	)
+
+	content := container.NewBorder(
+		topBar,
+		nil,
+		nil,
+		nil,
+		appInstance.DownloadList,
+	)
+
+	myWindow.SetContent(content)
+
+	// เริ่ม Goroutine สำหรับอัปเดต UI อัตโนมัติ
+	go func() {
+		for {
+			time.Sleep(500 * time.Millisecond)
+			appInstance.UpdateUI()
+		}
+	}()
+
+	myWindow.ShowAndRun()
+}
