@@ -555,6 +555,7 @@ type DownloadItem struct {
 	Progress       float64
 	Title          string
 	ID             int
+	IsRemoving     bool // ✅ เพิ่ม flag ป้องกันการลบซ้ำ
 }
 
 type App struct {
@@ -767,88 +768,77 @@ func (a *App) ShowRenameDialog(item *DownloadItem) {
 		}, a.Window)
 }
 
+// ✅ แก้ไข startDownload ให้ทำงานร่วมกับ Remove ได้
 func (a *App) startDownload(item *DownloadItem) {
 	defer func() {
 		if r := recover(); r != nil {
-			item.Status = StatusError
-			a.UpdateUI()
 			log.Printf("Panic in download %d: %v", item.ID, r)
 		}
-		a.Wg.Done()
+		a.Wg.Done() // ต้องทำก่อน UpdateUI
+		a.UpdateUI()
 	}()
+
+	if item.IsRemoving {
+		log.Printf("Download %d cancelled before start", item.ID)
+		return
+	}
 
 	item.FileNameLocked = true
 	item.Status = StatusRunning
+	a.UpdateUI()
 
 	statusChan := make(chan string, 100)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
-	done := make(chan struct{})
-	defer close(done)
-
-	// Start download goroutine
+	// Start download
 	go func() {
-		defer close(statusChan)
 		err := item.Wrapper.Download(statusChan)
-		if err != nil {
+		if err != nil && !item.IsRemoving {
 			a.handleDownloadErrorSafe(item, err)
 		}
 	}()
 
-	// Main loop: read status messages and update UI
 	for {
 		select {
-		case <-done:
-			return
-
 		case msg, ok := <-statusChan:
 			if !ok {
-				// Channel closed, download finished
-				a.UpdateUI()
 				return
 			}
-			// Update status from message
-			if strings.Contains(msg, "✅") {
-				item.Status = StatusCompleted
-			} else if strings.Contains(msg, "❌") {
-				item.Status = StatusError
-			} else if strings.Contains(msg, "⏸️") {
-				item.Status = StatusWaitingURL
-			} else if strings.Contains(msg, "⏹️") {
-				item.Status = StatusCancelled
-			} else if strings.Contains(msg, "🔄") {
-				item.Status = StatusRunning
-			}
+			// Update status
+			item.Status = parseStatus(msg)
 
 		case <-ticker.C:
-			// Drain remaining messages (non-blocking)
-			drainedCount := 0
-			for drainedCount < 10 {
-				select {
-				case msg, ok := <-statusChan:
-					if !ok {
-						a.UpdateUI()
-						return
-					}
-					if strings.Contains(msg, "✅") {
-						item.Status = StatusCompleted
-					}
-					drainedCount++
-				default:
-					break
-				}
-			}
-
-			// Update progress from wrapper
 			progress, status, title := item.Wrapper.GetProgress()
-			item.Progress = progress
-			item.Status = status
+			if progress >= 0 {
+				item.Progress = progress
+			}
+			if status != "" && status != StatusError {
+				item.Status = status
+			}
 			if title != "" && title != item.Title {
 				item.Title = title
 			}
 			a.UpdateUI()
 		}
+	}
+}
+
+// Helper: แปลงข้อความเป็น Status
+func parseStatus(msg string) DownloadStatus {
+	switch {
+	case strings.Contains(msg, "✅"):
+		return StatusCompleted
+	case strings.Contains(msg, "❌"):
+		return StatusError
+	case strings.Contains(msg, "⏸️"):
+		return StatusWaitingURL
+	case strings.Contains(msg, "⏹️"):
+		return StatusCancelled
+	case strings.Contains(msg, "🔄"):
+		return StatusRunning
+	default:
+		return StatusRunning
 	}
 }
 
@@ -885,48 +875,89 @@ func (a *App) CancelDownload(index int) {
 	}
 }
 
+// ✅ แก้ไข RemoveDownload ให้ปลอดภัย
 func (a *App) RemoveDownload(index int) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if index < len(a.Items) {
-		item := a.Items[index]
-		if item.Wrapper.IsRunning {
-			select {
-			case item.Wrapper.CancelChan <- true:
-			default:
-			}
-			time.Sleep(200 * time.Millisecond)
-		}
-
-		// ✅ Use TempFileTracker instead of glob patterns
-		a.TempTracker.CleanupFiles(item.ID)
-
-		// Also try basic cleanup for any leftover files
-		patterns := []string{"*.ytdl", "*.log", "*.part"}
-		for _, pattern := range patterns {
-			files, _ := filepath.Glob(filepath.Join(item.OutputDir, pattern))
-			for _, f := range files {
-				if strings.Contains(f, item.FileName) {
-					os.Remove(f)
-				}
-			}
-		}
-
-		a.Items = append(a.Items[:index], a.Items[index+1:]...)
-		a.UpdateUI()
+	if index >= len(a.Items) {
+		a.mu.Unlock()
+		return
 	}
+
+	item := a.Items[index]
+	if item.IsRemoving {
+		a.mu.Unlock()
+		return
+	}
+	item.IsRemoving = true
+	a.mu.Unlock()
+
+	// ยกเลิกการดาวน์โหลด
+	if item.Wrapper.IsRunning {
+		select {
+		case item.Wrapper.CancelChan <- true:
+		default:
+		}
+	}
+
+	// ✅ รอให้ goroutine หยุดด้วย timeout
+	timeout := time.After(2 * time.Second)
+	done := make(chan struct{})
+	go func() {
+		a.Wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		log.Printf("Download %d stopped gracefully", item.ID)
+	case <-timeout:
+		log.Printf("Warning: Force remove download %d", item.ID)
+	}
+
+	// ✅ ลบออกจาก slice (ต้องล็อคอีกครั้ง)
+	a.mu.Lock()
+	// หา index อีกครั้ง (เผื่อมีการเปลี่ยนแปลง)
+	newIndex := -1
+	for i, it := range a.Items {
+		if it.ID == item.ID {
+			newIndex = i
+			break
+		}
+	}
+	if newIndex != -1 {
+		a.Items = append(a.Items[:newIndex], a.Items[newIndex+1:]...)
+	}
+	a.mu.Unlock()
+
+	// Cleanup temp files
+	a.TempTracker.CleanupFiles(item.ID)
+
+	// Cleanup other temp files
+	patterns := []string{"*.ytdl", "*.log", "*.part", "*.fragment", "*.fragments"}
+	for _, pattern := range patterns {
+		files, _ := filepath.Glob(filepath.Join(item.OutputDir, pattern))
+		for _, f := range files {
+			if strings.Contains(f, item.FileName) {
+				os.Remove(f)
+			}
+		}
+	}
+
+	a.UpdateUI()
 }
 
+// ✅ แก้ไข UpdateUI ไม่ให้ล็อคตอน Refresh
 func (a *App) UpdateUI() {
+	// อ่านข้อมูลที่จำเป็น
+	a.mu.Lock()
+	count := len(a.Items)
+	a.mu.Unlock()
+
 	fyne.Do(func() {
 		if a.DownloadList != nil {
 			a.DownloadList.Refresh()
 		}
 		if a.QueueCount != nil {
-			a.mu.Lock()
-			count := len(a.Items)
-			a.mu.Unlock()
 			a.QueueCount.SetText(fmt.Sprintf("📊 คิว: %d", count))
 		}
 	})
