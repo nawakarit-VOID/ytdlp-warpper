@@ -24,6 +24,18 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
+// ==================== Configuration ====================
+
+type DownloadConfig struct {
+	ConcurrentFragments int    // -N
+	LimitRate           string // --limit-rate (เช่น "5M", "10M", "1M")
+}
+
+var GlobalConfig = DownloadConfig{
+	ConcurrentFragments: 8,
+	LimitRate:           "5M",
+}
+
 // ==================== Core Downloader ====================
 
 type YtDlpWrapper struct {
@@ -44,6 +56,7 @@ type YtDlpWrapper struct {
 	CancelChan   chan bool
 	IsRunning    bool
 	ID           int
+	Config       DownloadConfig // ✅ เพิ่ม
 }
 
 type YtdlFile struct {
@@ -59,7 +72,7 @@ type YtdlFile struct {
 
 var idCounter int64
 
-func NewYtDlpWrapper(url, outputDir, fileName string, concurrent, id int) *YtDlpWrapper {
+func NewYtDlpWrapper(url, outputDir, fileName string, concurrent int, id int, config DownloadConfig) *YtDlpWrapper {
 	return &YtDlpWrapper{
 		URL:          url,
 		OutputDir:    outputDir,
@@ -77,6 +90,7 @@ func NewYtDlpWrapper(url, outputDir, fileName string, concurrent, id int) *YtDlp
 		CancelChan:   make(chan bool, 1),
 		IsRunning:    false,
 		ID:           id,
+		Config:       config, // ✅ เพิ่ม
 	}
 }
 
@@ -197,7 +211,6 @@ func extractURLBase(url string) string {
 
 // ✅ แก้ไข: จัดการ error และ log อย่างถูกต้อง
 func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
-	// ✅ เพิ่ม Context timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
@@ -211,9 +224,14 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 		"--retries", "3",
 		"--socket-timeout", "30",
 		"-o", outputPath,
-		"--limit-rate", "5M",
-		url,
 	}
+
+	// ✅ เพิ่ม limit-rate ถ้ามีการตั้งค่า
+	if w.Config.LimitRate != "" {
+		args = append(args, "--limit-rate", w.Config.LimitRate)
+	}
+
+	args = append(args, url)
 
 	// ✅ ใช้ CommandContext
 	cmd := exec.CommandContext(ctx, w.YtdlpPath, args...)
@@ -472,6 +490,7 @@ func NewApp() *App {
 	}
 }
 
+/*
 func (a *App) AddDownload(url, outputDir, fileName string) {
 	a.mu.Lock()
 	id := int(atomic.AddInt64(&idCounter, 1))
@@ -510,6 +529,127 @@ func (a *App) AddDownload(url, outputDir, fileName string) {
 		a.startDownload(item)
 	}()
 }
+*/
+
+// AddDownloadWithConfig
+func (a *App) AddDownloadWithConfig(url, outputDir, fileName string, concurrent int, limitRate string) {
+	a.mu.Lock()
+	id := int(atomic.AddInt64(&idCounter, 1))
+
+	if fileName == "" {
+		fileName = filepath.Base(url)
+		if strings.HasSuffix(fileName, ".m3u8") {
+			fileName = strings.TrimSuffix(fileName, ".m3u8") + ".mp4"
+		}
+	}
+
+	if !strings.Contains(fileName, ".") {
+		fileName = fileName + ".mp4"
+	}
+
+	// ✅ สร้าง Config สำหรับ item นี้
+	config := DownloadConfig{
+		ConcurrentFragments: concurrent,
+		LimitRate:           limitRate,
+	}
+
+	item := &DownloadItem{
+		URL:            url,
+		OutputDir:      outputDir,
+		FileName:       fileName,
+		FileNameLocked: false,
+		Wrapper:        NewYtDlpWrapper(url, outputDir, fileName, concurrent, id, config),
+		Status:         "⏳ กำลังเริ่ม...",
+		Progress:       0,
+		Title:          fileName,
+		ID:             id,
+	}
+	a.Items = append(a.Items, item)
+	a.mu.Unlock()
+
+	a.UpdateUI()
+
+	a.Wg.Add(1)
+	go func() {
+		a.Semaphore <- struct{}{}
+		defer func() { <-a.Semaphore }()
+		a.startDownload(item)
+	}()
+}
+
+// Dialog สำหรับตั้งค่าก่อนดาวน์โหลด
+func (a *App) ShowDownloadConfigDialog(url, outputDir, fileName string) {
+	// ✅ ดึงค่าจาก Global Config
+	concurrentEntry := widget.NewEntry()
+	concurrentEntry.Text = fmt.Sprintf("%d", GlobalConfig.ConcurrentFragments)
+	concurrentEntry.SetPlaceHolder("จำนวน fragments ที่โหลดพร้อมกัน (1-20)")
+
+	rateEntry := widget.NewEntry()
+	rateEntry.Text = GlobalConfig.LimitRate
+	rateEntry.SetPlaceHolder("จำกัดความเร็ว (เช่น 5M, 10M, 1M) เว้นว่างให้ไม่จำกัด")
+
+	// ✅ แสดงตัวอย่าง
+	exampleLabel := widget.NewLabel("ตัวอย่าง: 5M = 5 MB/s, 10M = 10 MB/s, 1M = 1 MB/s")
+	exampleLabel.Wrapping = fyne.TextWrapWord
+	exampleLabel.TextStyle = fyne.TextStyle{Italic: true}
+
+	items := []*widget.FormItem{
+		widget.NewFormItem("จำนวน fragments พร้อมกัน (-N)", concurrentEntry),
+		widget.NewFormItem("จำกัดความเร็ว (--limit-rate)", rateEntry),
+		widget.NewFormItem("", exampleLabel),
+	}
+
+	dialog.ShowForm("⚙️ ตั้งค่าการดาวน์โหลด", "เริ่มดาวน์โหลด", "ยกเลิก", items,
+		func(ok bool) {
+			if ok {
+				// ✅ อ่านค่าจากฟอร์ม
+				concurrent := GlobalConfig.ConcurrentFragments
+				if val, err := strconv.Atoi(concurrentEntry.Text); err == nil && val >= 1 && val <= 20 {
+					concurrent = val
+				}
+
+				limitRate := rateEntry.Text
+				if limitRate != "" {
+					// ✅ ตรวจสอบรูปแบบ
+					matched, _ := regexp.MatchString(`^\d+[KMG]?$`, limitRate)
+					if !matched {
+						dialog.ShowInformation("รูปแบบไม่ถูกต้อง",
+							"กรุณาใส่ตัวเลขตามด้วย K, M, หรือ G (เช่น 5M, 10M, 1M)",
+							a.Window)
+						return
+					}
+				}
+
+				// ✅ บันทึกค่าเป็น Global Config
+				GlobalConfig.ConcurrentFragments = concurrent
+				GlobalConfig.LimitRate = limitRate
+
+				// ✅ เริ่มดาวน์โหลด
+				os.MkdirAll(outputDir, 0755)
+				a.AddDownloadWithConfig(url, outputDir, fileName, concurrent, limitRate)
+			}
+		}, a.Window)
+}
+
+// ปุ่มแสดง Config ปัจจุบัน
+func (a *App) ShowCurrentConfigDialog() {
+	info := fmt.Sprintf(
+		"📊 การตั้งค่าปัจจุบัน:\n\n"+
+			"📥 จำนวน fragments พร้อมกัน: %d\n"+
+			"⚡ จำกัดความเร็ว: %s\n"+
+			"📌 โหลดพร้อมกันสูงสุด: %d",
+		GlobalConfig.ConcurrentFragments,
+		func() string {
+			if GlobalConfig.LimitRate == "" {
+				return "ไม่จำกัด"
+			}
+			return GlobalConfig.LimitRate
+		}(),
+		a.MaxConcurrent,
+	)
+
+	dialog.ShowInformation("⚙️ การตั้งค่าปัจจุบัน", info, a.Window)
+}
 
 func (a *App) ShowAddDialog() {
 	urlEntry := widget.NewEntry()
@@ -528,7 +668,7 @@ func (a *App) ShowAddDialog() {
 		widget.NewFormItem("Output", outputEntry),
 	}
 
-	dialog.ShowForm("➕ เพิ่มวิดีโอ", "เพิ่ม", "ยกเลิก", items,
+	dialog.ShowForm("➕ เพิ่มวิดีโอ", "ถัดไป ➡️", "ยกเลิก", items,
 		func(ok bool) {
 			if ok {
 				url := urlEntry.Text
@@ -550,8 +690,7 @@ func (a *App) ShowAddDialog() {
 					fileName = fileName + ".mp4"
 				}
 
-				os.MkdirAll(output, 0755)
-				a.AddDownload(url, output, fileName)
+				a.ShowDownloadConfigDialog(url, output, fileName)
 			}
 		}, a.Window)
 }
@@ -798,6 +937,11 @@ func main() {
 		appInstance.ShowSettingsDialog()
 	})
 
+	// เพิ่มปุ่มแสดง Config
+	configInfoBtn := widget.NewButtonWithIcon("📊", theme.InfoIcon(), func() {
+		appInstance.ShowCurrentConfigDialog()
+	})
+
 	appInstance.AddBtn = addBtn
 	appInstance.QueueCount = widget.NewLabel("📊 คิว: 0")
 
@@ -901,6 +1045,7 @@ func main() {
 	topBar := container.NewHBox(
 		addBtn,
 		settingsBtn,
+		configInfoBtn, // ✅ เพิ่มปุ่มแสดง Config
 		widget.NewSeparator(),
 		appInstance.QueueCount,
 		widget.NewLabel("|"),
