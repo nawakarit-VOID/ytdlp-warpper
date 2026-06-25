@@ -24,19 +24,139 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// ==================== Configuration ====================
+// ==================== STATUS MANAGEMENT ====================
+
+type DownloadStatus string
+
+const (
+	StatusPending    DownloadStatus = "⏳ รอเริ่ม"
+	StatusRunning    DownloadStatus = "🔄 กำลังดาวน์โหลด"
+	StatusMerging    DownloadStatus = "🔄 กำลังรวมไฟล์"
+	StatusCompleted  DownloadStatus = "✅ เสร็จ!"
+	StatusError      DownloadStatus = "❌ Error"
+	StatusCancelled  DownloadStatus = "⏹️ ยกเลิก"
+	StatusRetrying   DownloadStatus = "🔄 ลองใหม่"
+	StatusWaitingURL DownloadStatus = "⏸️ รอผู้ใช้เปลี่ยน URL"
+)
+
+// ==================== ATOMIC PROGRESS (Thread-Safe) ====================
+
+type AtomicProgress struct {
+	mu       sync.RWMutex
+	progress float64
+	status   DownloadStatus
+	title    string
+}
+
+func NewAtomicProgress() *AtomicProgress {
+	return &AtomicProgress{
+		progress: 0,
+		status:   StatusPending,
+		title:    "",
+	}
+}
+
+func (ap *AtomicProgress) Update(progress float64, status DownloadStatus, title string) {
+	ap.mu.Lock()
+	defer ap.mu.Unlock()
+	if progress >= 0 {
+		ap.progress = progress
+	}
+	if status != "" {
+		ap.status = status
+	}
+	if title != "" {
+		ap.title = title
+	}
+}
+
+func (ap *AtomicProgress) Get() (float64, DownloadStatus, string) {
+	ap.mu.RLock()
+	defer ap.mu.RUnlock()
+	return ap.progress, ap.status, ap.title
+}
+
+// ==================== TEMP FILE TRACKING ====================
+
+type TempFileTracker struct {
+	mu    sync.Mutex
+	files map[int][]string // itemID -> list of temp file paths
+}
+
+func NewTempFileTracker() *TempFileTracker {
+	return &TempFileTracker{
+		files: make(map[int][]string),
+	}
+}
+
+func (t *TempFileTracker) RegisterTempFile(itemID int, path string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.files[itemID] = append(t.files[itemID], path)
+}
+
+func (t *TempFileTracker) CleanupFiles(itemID int) int {
+	t.mu.Lock()
+	files := t.files[itemID]
+	delete(t.files, itemID)
+	t.mu.Unlock()
+
+	removed := 0
+	for _, f := range files {
+		if err := os.Remove(f); err == nil {
+			removed++
+		}
+	}
+	return removed
+}
+
+// ==================== CONFIGURATION PERSISTENCE ====================
 
 type DownloadConfig struct {
-	ConcurrentFragments int    // -N
-	LimitRate           string // --limit-rate (เช่น "5M", "10M", "1M")
+	ConcurrentFragments int    `json:"concurrent_fragments"`
+	LimitRate           string `json:"limit_rate"`
 }
 
-var GlobalConfig = DownloadConfig{
-	ConcurrentFragments: 8,
-	LimitRate:           "5M",
+func DefaultConfig() DownloadConfig {
+	return DownloadConfig{
+		ConcurrentFragments: 8,
+		LimitRate:           "5M",
+	}
 }
 
-// ==================== Core Downloader ====================
+var GlobalConfig = DefaultConfig()
+var configPath = filepath.Join(os.ExpandEnv("$HOME"), ".config", "idm-clone", "config.json")
+
+func SaveConfig(config DownloadConfig) error {
+	dir := filepath.Dir(configPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(configPath, data, 0644)
+}
+
+func LoadConfig() (DownloadConfig, error) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return DefaultConfig(), nil
+		}
+		return DownloadConfig{}, err
+	}
+
+	var config DownloadConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return DefaultConfig(), err
+	}
+	return config, nil
+}
+
+// ==================== CORE DOWNLOADER ====================
 
 type YtDlpWrapper struct {
 	URL          string
@@ -48,15 +168,13 @@ type YtDlpWrapper struct {
 	IsRetry      bool
 	URLHistory   []string
 	mu           sync.Mutex
-	Progress     float64
-	Status       string
 	SegmentCount int
 	DoneSegments int
-	Title        string
 	CancelChan   chan bool
 	IsRunning    bool
 	ID           int
-	Config       DownloadConfig // ✅ เพิ่ม
+	Config       DownloadConfig
+	AtomicProg   *AtomicProgress // ✅ Thread-safe progress
 }
 
 type YtdlFile struct {
@@ -67,8 +185,6 @@ type YtdlFile struct {
 	} `json:"fragments"`
 	URL string `json:"url"`
 }
-
-// ==================== Constructor ====================
 
 var idCounter int64
 
@@ -82,15 +198,13 @@ func NewYtDlpWrapper(url, outputDir, fileName string, concurrent int, id int, co
 		IsRetry:      false,
 		YtdlpPath:    findYtdlp(),
 		URLHistory:   []string{url},
-		Progress:     0,
-		Status:       "⏳ รอเริ่ม",
 		SegmentCount: 0,
 		DoneSegments: 0,
-		Title:        fileName,
 		CancelChan:   make(chan bool, 1),
 		IsRunning:    false,
 		ID:           id,
-		Config:       config, // ✅ เพิ่ม
+		Config:       config,
+		AtomicProg:   NewAtomicProgress(), // ✅ Initialize atomic progress
 	}
 }
 
@@ -98,7 +212,6 @@ func findYtdlp() string {
 	if path, err := exec.LookPath("yt-dlp"); err == nil {
 		return path
 	}
-	// Try common installation paths
 	commonPaths := []string{
 		"/usr/local/bin/yt-dlp",
 		"/usr/bin/yt-dlp",
@@ -114,49 +227,58 @@ func findYtdlp() string {
 
 func (w *YtDlpWrapper) updateProgress(line string) {
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	segCount := w.SegmentCount
+	doneSegs := w.DoneSegments
+	w.mu.Unlock()
 
 	if strings.Contains(line, "Downloading") && strings.Contains(line, "fragments") {
 		re := regexp.MustCompile(`(\d+)\s+fragments`)
 		if matches := re.FindStringSubmatch(line); len(matches) > 1 {
-			fmt.Sscanf(matches[1], "%d", &w.SegmentCount)
+			fmt.Sscanf(matches[1], "%d", &segCount)
+			w.mu.Lock()
+			w.SegmentCount = segCount
+			w.mu.Unlock()
 		}
 	}
 
 	if strings.Contains(line, "fragment") {
 		re := regexp.MustCompile(`fragment\s+(\d+)`)
 		if matches := re.FindStringSubmatch(line); len(matches) > 1 {
-			fmt.Sscanf(matches[1], "%d", &w.DoneSegments)
-			if w.SegmentCount > 0 {
-				w.Progress = float64(w.DoneSegments) / float64(w.SegmentCount) * 100
+			fmt.Sscanf(matches[1], "%d", &doneSegs)
+			w.mu.Lock()
+			w.DoneSegments = doneSegs
+			w.mu.Unlock()
+
+			if segCount > 0 {
+				progress := float64(doneSegs) / float64(segCount) * 100
+				w.AtomicProg.Update(progress, "", "")
 			}
 		}
 	}
 
 	if strings.Contains(line, "Merging") {
-		w.Status = "🔄 กำลังรวมไฟล์..."
-	}
-	if strings.Contains(line, "100%") || strings.Contains(line, "Merging completed") {
-		w.Progress = 100
-		w.Status = "✅ เสร็จ!"
-	}
-	if strings.Contains(line, "ERROR") || strings.Contains(line, "502") || strings.Contains(line, "403") {
-		w.Status = "❌ Error: " + line
+		w.AtomicProg.Update(-1, StatusMerging, "")
 	}
 
-	// ดึงชื่อวิดีโอ
+	if strings.Contains(line, "100%") || strings.Contains(line, "Merging completed") {
+		w.AtomicProg.Update(100, StatusCompleted, "")
+	}
+
+	if strings.Contains(line, "ERROR") || strings.Contains(line, "502") || strings.Contains(line, "403") {
+		w.AtomicProg.Update(-1, StatusError, "")
+	}
+
+	// Extract video title
 	if strings.Contains(line, "[download]") && strings.Contains(line, ".mp4") {
 		re := regexp.MustCompile(`\[download\]\s+(.+?\.mp4)`)
 		if matches := re.FindStringSubmatch(line); len(matches) > 1 {
-			w.Title = matches[1]
+			w.AtomicProg.Update(-1, "", matches[1])
 		}
 	}
 }
 
-func (w *YtDlpWrapper) GetProgress() (float64, string, string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.Progress, w.Status, w.Title
+func (w *YtDlpWrapper) GetProgress() (float64, DownloadStatus, string) {
+	return w.AtomicProg.Get()
 }
 
 func (w *YtDlpWrapper) findYtdlFile() (string, error) {
@@ -200,16 +322,6 @@ func (w *YtDlpWrapper) updateYtdlFile(ytdlPath, oldPattern, newURL string) error
 	return os.WriteFile(ytdlPath, []byte(newContent), 0644)
 }
 
-func extractURLBase(url string) string {
-	re := regexp.MustCompile(`(https?://[^/]+/[^?]+)`)
-	matches := re.FindStringSubmatch(url)
-	if len(matches) > 0 {
-		return matches[1]
-	}
-	return url
-}
-
-// ✅ แก้ไข: จัดการ error และ log อย่างถูกต้อง
 func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
@@ -226,16 +338,13 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 		"-o", outputPath,
 	}
 
-	// ✅ เพิ่ม limit-rate ถ้ามีการตั้งค่า
 	if w.Config.LimitRate != "" {
 		args = append(args, "--limit-rate", w.Config.LimitRate)
 	}
 
 	args = append(args, url)
 
-	// ✅ ใช้ CommandContext
 	cmd := exec.CommandContext(ctx, w.YtdlpPath, args...)
-
 	statusChan <- "🔄 กำลังดาวน์โหลด..."
 
 	stdout, err := cmd.StdoutPipe()
@@ -251,7 +360,6 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 		return fmt.Errorf("เริ่ม yt-dlp ไม่ได้: %v", err)
 	}
 
-	// Monitor cancellation
 	cancelDone := make(chan struct{})
 	go func() {
 		defer close(cancelDone)
@@ -263,7 +371,6 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 		}
 	}()
 
-	// ✅ ใช้ WaitGroup สำหรับจัดการ goroutines
 	var wg sync.WaitGroup
 	errorChan := make(chan string, 100)
 
@@ -331,7 +438,6 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 		}
 	}()
 
-	// ✅ รอให้ goroutines เสร็จ
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -339,10 +445,8 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 		close(errorChan)
 	}()
 
-	// ✅ รอด้วย timeout
 	select {
 	case <-done:
-		// เสร็จปกติ
 	case <-time.After(30 * time.Minute):
 		cmd.Process.Kill()
 		return fmt.Errorf("การดาวน์โหลดใช้เวลานานเกินไป")
@@ -354,19 +458,15 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 		return fmt.Errorf("timeout: %v", ctx.Err())
 	}
 
-	// ✅ รอให้ goroutine cancel เสร็จ
 	<-cancelDone
 
-	// ✅ เก็บ error messages ก่อน
 	var errorMessages []string
 	for errMsg := range errorChan {
 		errorMessages = append(errorMessages, errMsg)
 	}
 
-	// ✅ ตรวจสอบ error จาก cmd.Wait()
 	err = cmd.Wait()
 
-	// ✅ บันทึก log (ทำหลังจากตรวจสอบ error ทั้งหมด)
 	go func() {
 		logFile, logErr := os.Create(filepath.Join(w.OutputDir, fmt.Sprintf("%s.log", w.FileName)))
 		if logErr != nil {
@@ -385,7 +485,6 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 		logger.Printf("Download completed")
 	}()
 
-	// ✅ ตรวจสอบ error จาก errorChan ก่อน
 	if len(errorMessages) > 0 {
 		return fmt.Errorf("HTTP Error: %s", strings.Join(errorMessages, "; "))
 	}
@@ -403,7 +502,7 @@ func (w *YtDlpWrapper) Download(statusChan chan<- string) error {
 	w.IsRunning = true
 	defer func() {
 		w.IsRunning = false
-		close(statusChan) // ✅ ปิด channel เมื่อเสร็จ
+		close(statusChan)
 	}()
 
 	for {
@@ -413,13 +512,11 @@ func (w *YtDlpWrapper) Download(statusChan chan<- string) error {
 		err := w.runYtdlp(currentURL, statusChan)
 
 		if err == nil {
-			w.Progress = 100
-			w.Status = "✅ เสร็จ!"
+			w.AtomicProg.Update(100, StatusCompleted, "")
 			statusChan <- "✅ ดาวน์โหลดเสร็จ!"
 			return nil
 		}
 
-		// ตรวจสอบว่าถูกยกเลิก
 		select {
 		case <-w.CancelChan:
 			return fmt.Errorf("ผู้ใช้ยกเลิก")
@@ -428,19 +525,13 @@ func (w *YtDlpWrapper) Download(statusChan chan<- string) error {
 
 		errMsg := err.Error()
 		statusChan <- fmt.Sprintf("⚠️ Error: %s", errMsg)
-		w.Status = "❌ " + errMsg
+		w.AtomicProg.Update(-1, StatusError, "")
 
-		// ถ้าเป็น HTTP Error ให้หยุดรอผู้ใช้เปลี่ยน URL
-		if strings.Contains(errMsg, "HTTP Error") ||
-			strings.Contains(errMsg, "403") ||
-			strings.Contains(errMsg, "404") ||
-			strings.Contains(errMsg, "502") {
-
+		if isHTTPError(errMsg) {
 			statusChan <- "⏸️ กรุณาเปลี่ยน URL (HTTP Error)"
 			return fmt.Errorf("HTTP Error: %s", errMsg)
 		}
 
-		// ถ้า Error อื่นๆ ให้ลองใหม่อัตโนมัติ (จำกัดรอบ)
 		if attempt >= 3 {
 			statusChan <- "❌ ลองใหม่ครบ 3 รอบแล้ว หยุด"
 			return fmt.Errorf("ลองใหม่ครบ 3 รอบ: %s", errMsg)
@@ -452,11 +543,7 @@ func (w *YtDlpWrapper) Download(statusChan chan<- string) error {
 	}
 }
 
-func (w *YtDlpWrapper) autoGenerateNewURL(oldURL string) string {
-	return ""
-}
-
-// ==================== GUI Application ====================
+// ==================== GUI APPLICATION ====================
 
 type DownloadItem struct {
 	URL            string
@@ -464,7 +551,7 @@ type DownloadItem struct {
 	FileName       string
 	FileNameLocked bool
 	Wrapper        *YtDlpWrapper
-	Status         string
+	Status         DownloadStatus
 	Progress       float64
 	Title          string
 	ID             int
@@ -480,6 +567,7 @@ type App struct {
 	Wg            sync.WaitGroup
 	Semaphore     chan struct{}
 	MaxConcurrent int
+	TempTracker   *TempFileTracker // ✅ Track temp files
 }
 
 func NewApp() *App {
@@ -487,51 +575,10 @@ func NewApp() *App {
 		Items:         []*DownloadItem{},
 		Semaphore:     make(chan struct{}, 3),
 		MaxConcurrent: 3,
+		TempTracker:   NewTempFileTracker(), // ✅ Initialize tracker
 	}
 }
 
-/*
-func (a *App) AddDownload(url, outputDir, fileName string) {
-	a.mu.Lock()
-	id := int(atomic.AddInt64(&idCounter, 1))
-
-	if fileName == "" {
-		fileName = filepath.Base(url)
-		if strings.HasSuffix(fileName, ".m3u8") {
-			fileName = strings.TrimSuffix(fileName, ".m3u8") + ".mp4"
-		}
-	}
-
-	if !strings.Contains(fileName, ".") {
-		fileName = fileName + ".mp4"
-	}
-
-	item := &DownloadItem{
-		URL:            url,
-		OutputDir:      outputDir,
-		FileName:       fileName,
-		FileNameLocked: false,
-		Wrapper:        NewYtDlpWrapper(url, outputDir, fileName, 8, id),
-		Status:         "⏳ กำลังเริ่ม...",
-		Progress:       0,
-		Title:          fileName,
-		ID:             id,
-	}
-	a.Items = append(a.Items, item)
-	a.mu.Unlock()
-
-	a.UpdateUI()
-
-	a.Wg.Add(1)
-	go func() {
-		a.Semaphore <- struct{}{}
-		defer func() { <-a.Semaphore }()
-		a.startDownload(item)
-	}()
-}
-*/
-
-// AddDownloadWithConfig
 func (a *App) AddDownloadWithConfig(url, outputDir, fileName string, concurrent int, limitRate string) {
 	a.mu.Lock()
 	id := int(atomic.AddInt64(&idCounter, 1))
@@ -547,19 +594,19 @@ func (a *App) AddDownloadWithConfig(url, outputDir, fileName string, concurrent 
 		fileName = fileName + ".mp4"
 	}
 
-	// ✅ สร้าง Config สำหรับ item นี้
 	config := DownloadConfig{
 		ConcurrentFragments: concurrent,
 		LimitRate:           limitRate,
 	}
 
+	wrapper := NewYtDlpWrapper(url, outputDir, fileName, concurrent, id, config)
 	item := &DownloadItem{
 		URL:            url,
 		OutputDir:      outputDir,
 		FileName:       fileName,
 		FileNameLocked: false,
-		Wrapper:        NewYtDlpWrapper(url, outputDir, fileName, concurrent, id, config),
-		Status:         "⏳ กำลังเริ่ม...",
+		Wrapper:        wrapper,
+		Status:         StatusPending,
 		Progress:       0,
 		Title:          fileName,
 		ID:             id,
@@ -577,9 +624,7 @@ func (a *App) AddDownloadWithConfig(url, outputDir, fileName string, concurrent 
 	}()
 }
 
-// Dialog สำหรับตั้งค่าก่อนดาวน์โหลด
 func (a *App) ShowDownloadConfigDialog(url, outputDir, fileName string) {
-	// ✅ ดึงค่าจาก Global Config
 	concurrentEntry := widget.NewEntry()
 	concurrentEntry.Text = fmt.Sprintf("%d", GlobalConfig.ConcurrentFragments)
 	concurrentEntry.SetPlaceHolder("จำนวน fragments ที่โหลดพร้อมกัน (1-20)")
@@ -588,7 +633,6 @@ func (a *App) ShowDownloadConfigDialog(url, outputDir, fileName string) {
 	rateEntry.Text = GlobalConfig.LimitRate
 	rateEntry.SetPlaceHolder("จำกัดความเร็ว (เช่น 5M, 10M, 1M) เว้นว่างให้ไม่จำกัด")
 
-	// ✅ แสดงตัวอย่าง
 	exampleLabel := widget.NewLabel("ตัวอย่าง: 5M = 5 MB/s, 10M = 10 MB/s, 1M = 1 MB/s")
 	exampleLabel.Wrapping = fyne.TextWrapWord
 	exampleLabel.TextStyle = fyne.TextStyle{Italic: true}
@@ -602,7 +646,6 @@ func (a *App) ShowDownloadConfigDialog(url, outputDir, fileName string) {
 	dialog.ShowForm("⚙️ ตั้งค่าการดาวน์โหลด", "เริ่มดาวน์โหลด", "ยกเลิก", items,
 		func(ok bool) {
 			if ok {
-				// ✅ อ่านค่าจากฟอร์ม
 				concurrent := GlobalConfig.ConcurrentFragments
 				if val, err := strconv.Atoi(concurrentEntry.Text); err == nil && val >= 1 && val <= 20 {
 					concurrent = val
@@ -610,7 +653,6 @@ func (a *App) ShowDownloadConfigDialog(url, outputDir, fileName string) {
 
 				limitRate := rateEntry.Text
 				if limitRate != "" {
-					// ✅ ตรวจสอบรูปแบบ
 					matched, _ := regexp.MatchString(`^\d+[KMG]?$`, limitRate)
 					if !matched {
 						dialog.ShowInformation("รูปแบบไม่ถูกต้อง",
@@ -620,18 +662,15 @@ func (a *App) ShowDownloadConfigDialog(url, outputDir, fileName string) {
 					}
 				}
 
-				// ✅ บันทึกค่าเป็น Global Config
 				GlobalConfig.ConcurrentFragments = concurrent
 				GlobalConfig.LimitRate = limitRate
 
-				// ✅ เริ่มดาวน์โหลด
 				os.MkdirAll(outputDir, 0755)
 				a.AddDownloadWithConfig(url, outputDir, fileName, concurrent, limitRate)
 			}
 		}, a.Window)
 }
 
-// ปุ่มแสดง Config ปัจจุบัน
 func (a *App) ShowCurrentConfigDialog() {
 	info := fmt.Sprintf(
 		"📊 การตั้งค่าปัจจุบัน:\n\n"+
@@ -728,62 +767,104 @@ func (a *App) ShowRenameDialog(item *DownloadItem) {
 		}, a.Window)
 }
 
-// ✅ แก้ไข: จัดการ error และ panic อย่างถูกต้อง
 func (a *App) startDownload(item *DownloadItem) {
 	defer func() {
 		if r := recover(); r != nil {
-			item.Status = fmt.Sprintf("💥 Panic: %v", r)
+			item.Status = StatusError
 			a.UpdateUI()
-			log.Printf("Recovered from panic in download %d: %v", item.ID, r)
+			log.Printf("Panic in download %d: %v", item.ID, r)
 		}
 		a.Wg.Done()
 	}()
 
 	item.FileNameLocked = true
+	item.Status = StatusRunning
 
-	statusChan := make(chan string, 50)
-	ticker := time.NewTicker(500 * time.Millisecond)
+	statusChan := make(chan string, 100)
+	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 
-	// ✅ ใช้ WaitGroup เพื่อรอให้ Download เสร็จ
-	var downloadWg sync.WaitGroup
-	downloadWg.Add(1)
+	done := make(chan struct{})
+	defer close(done)
 
+	// Start download goroutine
 	go func() {
-		defer downloadWg.Done()
+		defer close(statusChan)
 		err := item.Wrapper.Download(statusChan)
 		if err != nil {
-			if strings.Contains(err.Error(), "HTTP Error") {
-				item.Status = "⚠️ " + err.Error()
-				a.UpdateUI()
-				fyne.Do(func() {
-					a.ShowURLDialog(item)
-				})
-			} else if !strings.Contains(err.Error(), "ผู้ใช้ยกเลิก") {
-				item.Status = "❌ " + err.Error()
-				a.UpdateUI()
-			}
+			a.handleDownloadErrorSafe(item, err)
 		}
 	}()
 
-	// ✅ อ่านสถานะจาก channel
+	// Main loop: read status messages and update UI
 	for {
 		select {
+		case <-done:
+			return
+
 		case msg, ok := <-statusChan:
 			if !ok {
-				// channel ถูกปิดแล้ว (Download เสร็จ)
-				downloadWg.Wait()
+				// Channel closed, download finished
+				a.UpdateUI()
 				return
 			}
-			item.Status = msg
-			progress, _, title := item.Wrapper.GetProgress()
+			// Update status from message
+			if strings.Contains(msg, "✅") {
+				item.Status = StatusCompleted
+			} else if strings.Contains(msg, "❌") {
+				item.Status = StatusError
+			} else if strings.Contains(msg, "⏸️") {
+				item.Status = StatusWaitingURL
+			} else if strings.Contains(msg, "⏹️") {
+				item.Status = StatusCancelled
+			} else if strings.Contains(msg, "🔄") {
+				item.Status = StatusRunning
+			}
+
+		case <-ticker.C:
+			// Drain remaining messages (non-blocking)
+			drainedCount := 0
+			for drainedCount < 10 {
+				select {
+				case msg, ok := <-statusChan:
+					if !ok {
+						a.UpdateUI()
+						return
+					}
+					if strings.Contains(msg, "✅") {
+						item.Status = StatusCompleted
+					}
+					drainedCount++
+				default:
+					break
+				}
+			}
+
+			// Update progress from wrapper
+			progress, status, title := item.Wrapper.GetProgress()
 			item.Progress = progress
+			item.Status = status
 			if title != "" && title != item.Title {
 				item.Title = title
 			}
-		case <-ticker.C:
 			a.UpdateUI()
 		}
+	}
+}
+
+func (a *App) handleDownloadErrorSafe(item *DownloadItem, err error) {
+	errMsg := err.Error()
+	if isHTTPError(errMsg) {
+		item.Status = StatusWaitingURL
+		a.UpdateUI()
+		// Show dialog in next event cycle (already thread-safe in Fyne)
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			a.ShowURLDialog(item)
+		}()
+	} else if !isUserCancelled(errMsg) {
+		item.Status = StatusError
+		a.UpdateUI()
 	}
 }
 
@@ -798,7 +879,7 @@ func (a *App) CancelDownload(index int) {
 			case item.Wrapper.CancelChan <- true:
 			default:
 			}
-			item.Status = "⏹️ กำลังยกเลิก..."
+			item.Status = StatusCancelled
 			a.UpdateUI()
 		}
 	}
@@ -818,13 +899,15 @@ func (a *App) RemoveDownload(index int) {
 			time.Sleep(200 * time.Millisecond)
 		}
 
-		// ✅ ลบไฟล์ .ytdl และ .log ที่ค้างอยู่
+		// ✅ Use TempFileTracker instead of glob patterns
+		a.TempTracker.CleanupFiles(item.ID)
+
+		// Also try basic cleanup for any leftover files
 		patterns := []string{"*.ytdl", "*.log", "*.part"}
 		for _, pattern := range patterns {
 			files, _ := filepath.Glob(filepath.Join(item.OutputDir, pattern))
 			for _, f := range files {
-				// ตรวจสอบว่าเป็นไฟล์ของ item นี้หรือไม่
-				if strings.Contains(f, item.FileName) || strings.Contains(f, fmt.Sprintf("%d_", item.ID)) {
+				if strings.Contains(f, item.FileName) {
 					os.Remove(f)
 				}
 			}
@@ -865,6 +948,13 @@ func (a *App) ShowSettingsDialog() {
 				if err == nil && val >= 1 && val <= 10 {
 					a.MaxConcurrent = val
 					a.Semaphore = make(chan struct{}, val)
+
+					// ✅ Save config to disk
+					GlobalConfig.ConcurrentFragments = val
+					if saveErr := SaveConfig(GlobalConfig); saveErr != nil {
+						log.Printf("Failed to save config: %v", saveErr)
+					}
+
 					dialog.ShowInformation("สำเร็จ",
 						fmt.Sprintf("ตั้งค่าโหลดพร้อมกันสูงสุดที่ %d รายการ", val),
 						a.Window)
@@ -882,7 +972,8 @@ func (a *App) ShowURLDialog(item *DownloadItem) {
 	urlEntry.SetPlaceHolder("ใส่ URL ใหม่...")
 	urlEntry.Text = item.URL
 
-	errorLabel := widget.NewLabel("⚠️ " + item.Status)
+	statusStr := string(item.Status)
+	errorLabel := widget.NewLabel("⚠️ " + statusStr)
 	errorLabel.Wrapping = fyne.TextWrapWord
 	errorLabel.TextStyle = fyne.TextStyle{Bold: true}
 	errorLabel.Importance = widget.DangerImportance
@@ -900,26 +991,50 @@ func (a *App) ShowURLDialog(item *DownloadItem) {
 					item.URL = newURL
 					item.Wrapper.URL = newURL
 					item.Wrapper.IsRetry = true
-					item.Status = "🔄 กำลังลองใหม่..."
+					item.Status = StatusRetrying
 					a.UpdateUI()
 
 					time.Sleep(500 * time.Millisecond)
 					a.Wg.Add(1)
 					go a.startDownload(item)
 				} else if newURL == item.URL {
-					item.Status = "⏳ URL เดิม, ลองใหม่..."
+					item.Status = StatusRetrying
 					a.UpdateUI()
 					a.Wg.Add(1)
 					go a.startDownload(item)
 				}
 			} else {
-				item.Status = "⏹️ รอผู้ใช้เปลี่ยน URL"
+				item.Status = StatusWaitingURL
 				a.UpdateUI()
 			}
 		}, a.Window)
 }
 
+// ==================== HELPER FUNCTIONS ====================
+
+func isHTTPError(msg string) bool {
+	httpErrors := []string{"HTTP Error", "403", "404", "502"}
+	for _, e := range httpErrors {
+		if strings.Contains(msg, e) {
+			return true
+		}
+	}
+	return false
+}
+
+func isUserCancelled(msg string) bool {
+	return strings.Contains(msg, "ผู้ใช้ยกเลิก") || strings.Contains(msg, "user cancel")
+}
+
+// ==================== MAIN ====================
+
 func main() {
+	// ✅ Load config on startup
+	loadedConfig, err := LoadConfig()
+	if err == nil {
+		GlobalConfig = loadedConfig
+	}
+
 	myApp := app.New()
 	myWindow := myApp.NewWindow("🎬 IDM Clone")
 	myWindow.Resize(fyne.NewSize(800, 500))
@@ -937,7 +1052,6 @@ func main() {
 		appInstance.ShowSettingsDialog()
 	})
 
-	// เพิ่มปุ่มแสดง Config
 	configInfoBtn := widget.NewButtonWithIcon("📊", theme.InfoIcon(), func() {
 		appInstance.ShowCurrentConfigDialog()
 	})
@@ -988,9 +1102,9 @@ func main() {
 			}
 
 			item := appInstance.Items[id]
-			container := obj.(*fyne.Container)
-			topBox := container.Objects[0].(*fyne.Container)
-			bottomBox := container.Objects[1].(*fyne.Container)
+			containerObj := obj.(*fyne.Container)
+			topBox := containerObj.Objects[0].(*fyne.Container)
+			bottomBox := containerObj.Objects[1].(*fyne.Container)
 
 			titleLabel := topBox.Objects[0].(*widget.Label)
 			urlLabel := topBox.Objects[2].(*widget.Label)
@@ -1013,7 +1127,7 @@ func main() {
 
 			progressBar.SetValue(item.Progress)
 
-			statusText := item.Status
+			statusText := string(item.Status)
 			if len(statusText) > 50 {
 				statusText = statusText[:50] + "..."
 			}
@@ -1045,7 +1159,7 @@ func main() {
 	topBar := container.NewHBox(
 		addBtn,
 		settingsBtn,
-		configInfoBtn, // ✅ เพิ่มปุ่มแสดง Config
+		configInfoBtn,
 		widget.NewSeparator(),
 		appInstance.QueueCount,
 		widget.NewLabel("|"),
