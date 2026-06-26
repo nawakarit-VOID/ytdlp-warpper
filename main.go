@@ -345,7 +345,12 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 	args = append(args, url)
 
 	cmd := exec.CommandContext(ctx, w.YtdlpPath, args...)
-	statusChan <- "🔄 กำลังดาวน์โหลด..."
+	//statusChan <- "🔄 กำลังดาวน์โหลด..."
+	statusChan <- "🔄 กำลังเรียก yt-dlp..."
+	w.AtomicProg.Update(0, StatusRunning, "")
+
+	// ✅ ส่งสถานะเมื่อเริ่มดาวน์โหลด
+	statusChan <- fmt.Sprintf("📥 กำลังดาวน์โหลดด้วย %d fragments", w.Concurrent)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -397,7 +402,13 @@ func (w *YtDlpWrapper) runYtdlp(url string, statusChan chan<- string) error {
 				default:
 				}
 			}
+			// ✅ ส่งสถานะเมื่อใกล้เสร็จ
+			if strings.Contains(line, "100%") {
+				statusChan <- "📦 กำลังรวมไฟล์..."
+				w.AtomicProg.Update(95, StatusMerging, "")
+			}
 		}
+
 		if err := scanner.Err(); err != nil {
 			select {
 			case errorChan <- fmt.Sprintf("stdout scanner error: %v", err):
@@ -505,9 +516,14 @@ func (w *YtDlpWrapper) Download(statusChan chan<- string) error {
 		close(statusChan)
 	}()
 
+	// ✅ ส่งสถานะเริ่มต้น
+	statusChan <- "🔄 เริ่มดาวน์โหลด..."
+	w.AtomicProg.Update(0, StatusRunning, w.FileName)
+
 	for {
 		attempt++
 		statusChan <- fmt.Sprintf("🔄 รอบที่ %d", attempt)
+		w.AtomicProg.Update(0, StatusRunning, "")
 
 		err := w.runYtdlp(currentURL, statusChan)
 
@@ -773,53 +789,90 @@ func (a *App) startDownload(item *DownloadItem) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("Panic in download %d: %v", item.ID, r)
+			item.Status = StatusError
+			a.UpdateUI()
 		}
-		a.Wg.Done() // ต้องทำก่อน UpdateUI
+		a.Wg.Done()
 		a.UpdateUI()
 	}()
 
 	if item.IsRemoving {
-		log.Printf("Download %d cancelled before start", item.ID)
 		return
 	}
 
 	item.FileNameLocked = true
 	item.Status = StatusRunning
+	item.Progress = 0
 	a.UpdateUI()
 
 	statusChan := make(chan string, 100)
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(150 * time.Millisecond) // ✅ อัพเดทถี่ขึ้น
 	defer ticker.Stop()
 
-	// Start download
+	// ✅ done channel สำหรับรับ signal จบงาน
+	done := make(chan struct{})
+
 	go func() {
+		defer close(done)
 		err := item.Wrapper.Download(statusChan)
 		if err != nil && !item.IsRemoving {
 			a.handleDownloadErrorSafe(item, err)
 		}
 	}()
 
+	// ✅ loop หลัก
 	for {
 		select {
 		case msg, ok := <-statusChan:
-			if !ok {
-				return
+			if ok {
+				// อัพเดทสถานะจาก message
+				newStatus := parseStatus(msg)
+				if newStatus != "" {
+					item.Status = newStatus
+					a.UpdateUI()
+				}
+
+				// ถ้าเป็นข้อความเสร็จ ให้อัพเดททันที
+				if strings.Contains(msg, "✅") || strings.Contains(msg, "เสร็จ") {
+					progress, status, title := item.Wrapper.GetProgress()
+					item.Progress = progress
+					item.Status = status
+					if title != "" {
+						item.Title = title
+					}
+					a.UpdateUI()
+				}
 			}
-			// Update status
-			item.Status = parseStatus(msg)
 
 		case <-ticker.C:
+			// อัพเดท progress จาก wrapper ทุกๆ 150ms
 			progress, status, title := item.Wrapper.GetProgress()
-			if progress >= 0 {
+			if progress >= 0 && progress != item.Progress {
 				item.Progress = progress
 			}
-			if status != "" && status != StatusError {
+			if status != "" && status != item.Status {
 				item.Status = status
 			}
 			if title != "" && title != item.Title {
 				item.Title = title
 			}
 			a.UpdateUI()
+
+		case <-done:
+			// ✅ download จบแล้ว อัพเดทครั้งสุดท้าย
+			progress, status, title := item.Wrapper.GetProgress()
+			item.Progress = progress
+			if status != "" {
+				item.Status = status
+			}
+			if title != "" {
+				item.Title = title
+			}
+			a.UpdateUI()
+
+			log.Printf("✅ Download %d completed with status: %s, progress: %.1f%%",
+				item.ID, item.Status, item.Progress)
+			return
 		}
 	}
 }
@@ -1100,6 +1153,12 @@ func main() {
 			progressBar := widget.NewProgressBar()
 			progressBar.Min = 0
 			progressBar.Max = 100
+
+			// ✅ เพิ่ม TextFormatter ให้แสดงเปอร์เซ็นต์
+			progressBar.TextFormatter = func() string {
+				return fmt.Sprintf("%.1f%%", progressBar.Value)
+			}
+
 			titleLabel := widget.NewLabel("ชื่อวิดีโอ")
 			statusLabel := widget.NewLabel("สถานะ")
 			urlLabel := widget.NewLabel("URL")
